@@ -1,0 +1,16 @@
+# Version ranges are bounded (not just >=) so a fresh install can't
+# silently jump a major version and behave differently than what this
+# project was actually developed and tested against. Floors match the
+# versions used throughout development; caps leave room for minor/patch
+# updates without pulling in a breaking major release.
+langgraph>=1.2.0,<2.0.0
+langgraph-checkpoint-sqlite>=3.0.0,<4.0.0
+langchain-core>=1.6.0,<2.0.0
+langchain-anthropic>=1.7.0,<2.0.0
+python-dotenv>=1.0.1,<2.0.0
+fastapi>=0.115.6,<1.0.0
+uvicorn[standard]>=0.32.1,<1.0.0
+pydantic>=2.10.4,<3.0.0
+pytest>=8.3.4,<10.0.0
+pytest-asyncio>=1.0.0,<2.0.0
+httpx>=0.28.1,<1.0.0

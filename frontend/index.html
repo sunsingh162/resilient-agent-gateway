@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Campus IT Helpdesk Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2.5rem; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  label { display: block; font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 0.5rem; margin-bottom: 0.75rem; font-family: inherit; font-size: 0.95rem; }
+  button { padding: 0.5rem 1rem; cursor: pointer; border-radius: 6px; border: 1px solid #8888; background: #eee; }
+  button.primary { background: #2563eb; color: white; border-color: #2563eb; }
+  button.deny { background: #dc2626; color: white; border-color: #dc2626; }
+  button.approve { background: #16a34a; color: white; border-color: #16a34a; }
+  pre { background: #8881; padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
+  .approval-card { border: 1px solid #f59e0b88; background: #f59e0b11; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .muted { color: #888; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>Campus IT Helpdesk Agent</h1>
+<p class="muted">Minimal UI for the FastAPI backend — run/stream/approve/deny/forensics.</p>
+
+<label for="apiBase">API base URL</label>
+<input id="apiBase" value="http://localhost:8000" />
+
+<fieldset>
+  <legend>Submit a ticket</legend>
+  <label for="threadId">Thread ID (conversation)</label>
+  <input id="threadId" value="" placeholder="auto-generated if left blank" />
+  <label for="message">Message</label>
+  <textarea id="message" rows="3" placeholder="e.g. My Wi-Fi keeps dropping every few minutes on campus"></textarea>
+  <button class="primary" onclick="submitTicket()">Send</button>
+  <p id="submitStatus" class="muted"></p>
+  <pre id="ticketResult" style="display:none"></pre>
+</fieldset>
+
+<h2>Pending approvals</h2>
+<p class="muted">Write actions (creating a ticket) pause here until a human approves, denies, or edits-and-approves them.</p>
+<button onclick="loadApprovals()">Refresh</button>
+<div id="approvalsList"></div>
+
+<h2>Recent decisions</h2>
+<p class="muted">Results of approve/deny/edit-approve actions — kept here since a resolved card disappears from Pending approvals right away.</p>
+<div id="decisionLog"></div>
+
+<script>
+function apiBase() { return document.getElementById('apiBase').value.replace(/\/$/, ''); }
+
+function newThreadId() {
+  return 'thread-' + Math.random().toString(36).slice(2, 10);
+}
+
+async function submitTicket() {
+  const status = document.getElementById('submitStatus');
+  const resultBox = document.getElementById('ticketResult');
+  let threadId = document.getElementById('threadId').value.trim();
+  if (!threadId) {
+    threadId = newThreadId();
+    document.getElementById('threadId').value = threadId;
+  }
+  const message = document.getElementById('message').value;
+  status.textContent = 'Sending...';
+  resultBox.style.display = 'none';
+
+  try {
+    const res = await fetch(`${apiBase()}/tickets/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: threadId, message }),
+    });
+    const data = await res.json();
+    resultBox.style.display = 'block';
+    resultBox.textContent = JSON.stringify(data, null, 2);
+    status.textContent = data.pending_approval
+      ? 'Waiting on a human approval — see Pending approvals below.'
+      : 'Done.';
+    if (data.pending_approval) loadApprovals();
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message + ' (is the backend running and CORS-reachable?)';
+  }
+}
+
+async function loadApprovals() {
+  const container = document.getElementById('approvalsList');
+  container.innerHTML = '<p class="muted">Loading...</p>';
+  try {
+    const res = await fetch(`${apiBase()}/pending-approvals`);
+    const items = await res.json();
+    if (!items.length) {
+      container.innerHTML = '<p class="muted">Nothing pending.</p>';
+      return;
+    }
+    container.innerHTML = '';
+    for (const item of items) {
+      container.appendChild(renderApprovalCard(item));
+    }
+  } catch (err) {
+    container.innerHTML = `<p class="muted">Error loading approvals: ${err.message}</p>`;
+  }
+}
+
+function renderApprovalCard(item) {
+  const draft = item.draft || {};
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.innerHTML = `
+    <strong>${item.category}</strong> ticket for thread <code>${item.thread_id}</code>
+    <pre>${JSON.stringify(draft, null, 2)}</pre>
+    <label>Edit description (optional, for Edit &amp; Approve)</label>
+    <textarea rows="2" class="editField">${draft.description || ''}</textarea>
+    <button class="approve" onclick="decide('${item.thread_id}', 'approve', this)">Approve</button>
+    <button class="deny" onclick="decide('${item.thread_id}', 'deny', this)">Deny</button>
+    <button onclick="decide('${item.thread_id}', 'edit-approve', this)">Edit &amp; Approve</button>
+  `;
+  return card;
+}
+
+async function decide(threadId, action, buttonEl) {
+  const card = buttonEl.closest('.approval-card');
+  let url = `${apiBase()}/approvals/${threadId}/${action}`;
+  let options = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
+
+  if (action === 'edit-approve') {
+    const editedDescription = card.querySelector('.editField').value;
+    options.body = JSON.stringify({ edited_fields: { description: editedDescription } });
+  }
+
+  buttonEl.disabled = true;
+  const log = document.getElementById('decisionLog');
+  try {
+    const res = await fetch(url, options);
+    const data = await res.json();
+    // Logged separately (not inside the card) because loadApprovals() below
+    // rebuilds the pending list right after — a resolved card disappears
+    // from it immediately, which would wipe out a result shown inline.
+    log.insertAdjacentHTML(
+      'afterbegin',
+      `<div class="approval-card"><strong>${action}</strong> on thread <code>${threadId}</code><pre>${JSON.stringify(data, null, 2)}</pre></div>`
+    );
+    loadApprovals();
+  } catch (err) {
+    log.insertAdjacentHTML('afterbegin', `<p class="muted">Error deciding on ${threadId}: ${err.message}</p>`);
+  }
+}
+
+loadApprovals();
+</script>
+
+</body>
+</html>
