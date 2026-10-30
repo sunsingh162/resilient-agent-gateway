@@ -1,5 +1,7 @@
 import json
-from typing import Optional
+import time
+import uuid
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -13,7 +15,7 @@ from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
 
-app = FastAPI(title="Campus IT Helpdesk Agent")
+app = FastAPI(title="Resilient Agent Gateway — Campus IT Helpdesk Swarm")
 
 # Dev-only convenience: the minimal frontend (frontend/index.html) is a
 # static file with no build step, typically opened straight from disk or
@@ -53,6 +55,59 @@ class TimelineEntryResponse(BaseModel):
     anomalies: list[str]
 
 
+class AnalyzeRequest(BaseModel):
+    message: str
+    # Optional: omit it to start a fresh conversation, pass a prior one to
+    # continue it (same checkpointer-backed continuity as /tickets/run).
+    thread_id: Optional[str] = None
+
+
+class PendingWrite(BaseModel):
+    category: str
+    draft: dict
+
+
+class AnalyzeResponse(BaseModel):
+    thread_id: str
+    # completed: the swarm finished and `response` is final.
+    # awaiting_approval: paused at hitl_gate — resolve via /approvals/{thread_id}/*.
+    # blocked: ingress guardrail stopped it (prompt injection) before any LLM call.
+    status: Literal["completed", "awaiting_approval", "blocked"]
+    category: Optional[str]
+    dispatch_categories: list[str]
+    response: Optional[str]
+    pending_writes: list[PendingWrite]
+    escalated: bool
+    latency_ms: int
+
+
+def _pending_writes(result: dict) -> list[PendingWrite]:
+    return [
+        PendingWrite(category=item.value["category"], draft=item.value["draft"])
+        for item in result.get("__interrupt__") or []
+        if isinstance(item.value, dict) and item.value.get("type") == "write_approval"
+    ]
+
+
+def _to_analyze_response(thread_id: str, result: dict, latency_ms: int) -> AnalyzeResponse:
+    if result.get("__interrupt__"):
+        status = "awaiting_approval"
+    elif result.get("injection_blocked"):
+        status = "blocked"
+    else:
+        status = "completed"
+    return AnalyzeResponse(
+        thread_id=thread_id,
+        status=status,
+        category=result.get("category"),
+        dispatch_categories=result.get("dispatch_categories") or [],
+        response=result.get("response"),
+        pending_writes=_pending_writes(result),
+        escalated=result.get("escalated", False),
+        latency_ms=latency_ms,
+    )
+
+
 def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
     return TicketResponse(
         thread_id=thread_id,
@@ -63,9 +118,31 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
     )
 
 
+# The highest Phase 4 step that is actually live-wired into request handling,
+# bumped only when a step's capability is on the real request path, not
+# merely built and verified standalone.
+PHASE4_LIVE_STEP = 2
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "phase4_live_step": PHASE4_LIVE_STEP}
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
+    """Phase 4 Step 2: synchronous gateway endpoint — blocks until the swarm
+    finishes the turn (or pauses at hitl_gate) and returns the full result.
+
+    A plain `def` (not `async def`) on purpose: run_ticket() is blocking,
+    so FastAPI runs it in its threadpool instead of stalling the event loop
+    for every other request while a 15–20s multi-agent turn runs.
+    """
+    thread_id = payload.thread_id or f"analyze-{uuid.uuid4()}"
+    start = time.monotonic()
+    result = run_ticket(thread_id, payload.message)
+    latency_ms = int((time.monotonic() - start) * 1000)
+    return _to_analyze_response(thread_id, result, latency_ms)
 
 
 @app.post("/tickets/run", response_model=TicketResponse)

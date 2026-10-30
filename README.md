@@ -33,7 +33,7 @@ python scripts/run_swarm.py       # Step 1: one full swarm run from a plain scri
 | # | Step | Adds | Status |
 |---|---|---|---|
 | 1 | Confirm the base swarm | Phase 3 swarm imported unchanged + `scripts/run_swarm.py` end-to-end runner | ✅ |
-| 2 | Gateway + sync endpoint | `POST /analyze` | ⏳ |
+| 2 | Gateway + sync endpoint | `POST /analyze` (blocks until the swarm finishes or pauses at HITL) + `phase4_live_step` on `/health` | ✅ |
 | 3 | Streaming (SSE) | `POST /analyze/stream` with typed events | ⏳ |
 | 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}` | ⏳ |
 | 5 | Tracing | OpenTelemetry spans → Arize Phoenix | ⏳ |
@@ -44,6 +44,34 @@ python scripts/run_swarm.py       # Step 1: one full swarm run from a plain scri
 | 10 | Fallback cascade | Tier-keyed cascade + circuit breaker + mid-stream hot-swap | ⏳ |
 | 11 | Failure drill | Self-contained "cut cable" script + cascade tripwires | ⏳ |
 | 12 | Wiring audit | Live-wired vs standalone honesty table | ⏳ |
+
+---
+
+## Gateway API
+
+Start it from `backend/`:
+
+```bash
+uvicorn app.main:app --port 8000
+```
+
+Interactive docs are at `http://localhost:8000/docs`.
+
+| Endpoint | Step | Purpose |
+|---|---|---|
+| `POST /analyze` | 2 | Sync. Sends a ticket and blocks until the swarm finishes the turn. `thread_id` is optional: omit it to start a new conversation. |
+| `GET /health` | 2 | Liveness check, plus `phase4_live_step`: the highest step that is live-wired into request handling |
+| `POST /approvals/{thread_id}/approve` · `/deny` · `/edit-approve` | Phase 3 | Resolve a write paused at the HITL gate |
+| `GET /pending-approvals` · `GET /forensics/{thread_id}` · `POST /tickets/run` · `POST /tickets/stream` | Phase 3 | Unchanged from Phase 3 |
+
+**Step 2 checklist (a curl returns a complete result after blocking):**
+
+```bash
+curl -s -X POST localhost:8000/analyze -H 'Content-Type: application/json' \
+  -d '{"message":"My Wi-Fi keeps dropping every few minutes in the library. Any fix?"}'
+```
+
+The call blocks for about 15s and returns `"status": "completed"` with the full synthesised `response`, `dispatch_categories` and `latency_ms`. A ticket that needs staff action, such as `"My student account S1002 is locked"`, returns `"status": "awaiting_approval"` with each draft in `pending_writes`. Call `/approvals/{thread_id}/approve` once per draft to finish the turn.
 
 ---
 
