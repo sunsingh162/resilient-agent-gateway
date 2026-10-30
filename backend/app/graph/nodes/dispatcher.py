@@ -105,8 +105,16 @@ def parallel_specialist_worker_node(state: TicketState) -> dict:
 
     # thread_id passed through explicitly — this nested compiled graph does
     # NOT automatically inherit the outer master graph's invoke() config.
+    # metadata.specialist (Phase 4, Step 3): this nested run gets its own
+    # checkpoint namespace with no link back to the Send task that spawned
+    # it, so when two specialists run in parallel their agent/tools events
+    # are indistinguishable on the stream. Metadata rides along on every
+    # streamed event, which is how the SSE layer attributes each tool call.
     start = time.monotonic()
-    result = get_specialist_graph().invoke(sub_state, {"configurable": {"thread_id": state["thread_id"]}})
+    result = get_specialist_graph().invoke(
+        sub_state,
+        {"configurable": {"thread_id": state["thread_id"]}, "metadata": {"specialist": category}},
+    )
     elapsed = time.monotonic() - start
 
     logger.info(

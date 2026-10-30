@@ -95,4 +95,4 @@ def test_injection_blocked_turn_reports_blocked(monkeypatch):
 
 
 def test_health_reports_the_live_wired_step():
-    assert client.get("/health").json() == {"status": "ok", "phase4_live_step": 2}
+    assert client.get("/health").json() == {"status": "ok", "phase4_live_step": main.PHASE4_LIVE_STEP}

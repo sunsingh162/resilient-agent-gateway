@@ -14,6 +14,8 @@ load_dotenv()
 from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
+from .stream_schemas import to_sse  # noqa: E402
+from .streaming import stream_analysis  # noqa: E402
 
 app = FastAPI(title="Resilient Agent Gateway — Campus IT Helpdesk Swarm")
 
@@ -121,7 +123,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 2
+PHASE4_LIVE_STEP = 3
 
 
 @app.get("/health")
@@ -143,6 +145,26 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     result = run_ticket(thread_id, payload.message)
     latency_ms = int((time.monotonic() - start) * 1000)
     return _to_analyze_response(thread_id, result, latency_ms)
+
+
+@app.post("/analyze/stream")
+def analyze_stream(payload: AnalyzeRequest) -> StreamingResponse:
+    """Phase 4 Step 3: same turn as /analyze, streamed as Server-Sent Events —
+    one typed event per handoff, tool call, tool result, specialist finding,
+    approval pause and the final answer (schemas in stream_schemas.py).
+
+    The generator is sync, so Starlette iterates it in a worker thread and
+    flushes each event as soon as it's yielded.
+    """
+    thread_id = payload.thread_id or f"stream-{uuid.uuid4()}"
+    events = (to_sse(event) for event in stream_analysis(thread_id, payload.message))
+    return StreamingResponse(
+        events,
+        media_type="text/event-stream",
+        # no-transform/X-Accel-Buffering: stop proxies (nginx, etc.) from
+        # buffering the stream into one blob, which would defeat the point.
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/tickets/run", response_model=TicketResponse)
