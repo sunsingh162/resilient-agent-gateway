@@ -50,7 +50,7 @@ Phoenix is optional. If it isn't running, the gateway works normally and tracing
 | 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}`. Jobs are stored in SQLite, so results survive client disconnects and server restarts | ✅ |
 | 5 | Tracing | OpenTelemetry → Arize Phoenix: a root `helpdesk.turn` span per request, plus one span per graph node, LLM call and tool call, including inside the parallel specialists | ✅ |
 | 6 | LLM-as-judge | Pulls finished turns from Phoenix and grades correctness, safety and tool use (1–5). Scores are written back to Phoenix as annotations and to `judge.db` | ✅ |
-| 7 | Monitoring daemon | Named SLOs + paging tripwires | ⏳ |
+| 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
 | 8 | Semantic cache | Embedding cache + cost model | ⏳ |
 | 9 | Model router | Per-agent cost tiers + budget | ⏳ |
 | 10 | Fallback cascade | Tier-keyed cascade + circuit breaker + mid-stream hot-swap | ⏳ |
@@ -222,6 +222,58 @@ Step 6 checklist: PASS — good 5.00 (pass) vs bad 1.00 (fail), gap 4.00
 
 The duplicated work is the behaviour first seen in Step 1. Each parallel specialist reads the whole multi-issue ticket rather than only its own part. It's left unfixed here on purpose. Step 6 adds the *measurement*, and the failing scores are exactly the signal Step 7's judge-score tripwire is meant to catch.
 
+### Monitoring daemon (Step 7)
+
+`app/monitoring.py` reads a rolling window (60 minutes by default) from three sources the earlier steps already fill: `helpdesk.turn` spans in Phoenix, `judge.db` and `jobs.db`. It evaluates five named SLOs:
+
+| SLO | Target | Source | Severity | Why |
+|---|---|---|---|---|
+| `turn_latency_p95` | ≤ 30,000 ms | Phoenix `helpdesk.latency_ms` | page | A healthy two-specialist turn takes 13–22s, so a p95 above 30s means something upstream is slow |
+| `turn_error_rate` | ≤ 10% | Phoenix `helpdesk.status` | page | Turns that raised, such as a provider outage or running out of credit |
+| `judge_score_mean` | ≥ 3.5 | `judge.db` | page | Quality regression that latency and errors can't see |
+| `judge_safety_violations` | ≤ 0 | `judge.db` (safety ≤ 2) | page | **Zero tolerance.** One reply that leaks PII or fakes an account change is an incident on its own |
+| `async_job_failure_rate` | ≤ 20% | `jobs.db` | ticket | Matters, but not a 3am wake-up |
+
+**Paging behaviour:**
+- **When it pages:** once, when an SLO goes from OK to BREACH. The incident then stays open with no re-paging every tick, and a resolution is recorded when the metric recovers.
+- **Restarts:** open incidents are saved in `monitor_state.json`, so restarting the daemon doesn't re-page something already being handled.
+- **Too little traffic:** below 5 samples an SLO reports `no data` instead of judging. The zero-tolerance safety SLO is the exception and judges from the first sample.
+- **Seeded turns** are excluded from real-traffic monitoring.
+
+```bash
+cd backend
+python -m app.monitoring --once                # one tick, exits 1 if anything is breached
+python -m app.monitoring --interval 60         # run as a daemon
+```
+
+**First tick on real traffic (last 24h, seeds excluded).** Both pages are real:
+
+```
+turn_latency_p95       21646   <= 30000    6  OK
+turn_error_rate         0.14   <= 0.1      7  BREACH (page)  1 errored            ← the async job that died when API credit ran out
+judge_score_mean        3.46   >= 3.5      5  BREACH (page)  2 failed the judge   ← Step 6's duplicate-ticket turns
+judge_safety_violations    0   <= 0        5  OK
+async_job_failure_rate  0.50   <= 0.2      2  no data                             ← only 2 jobs finished, below min sample
+```
+
+**Step 7 checklist (a synthetic degradation fires the correct tripwire):**
+
+```bash
+cd backend && python scripts/run_step7_monitor.py     # needs Phoenix running + API key
+```
+
+The drill pins the window to its own start time, so only its own seeds count, and lowers `min_sample` to 1. Thresholds are untouched. It injects one degradation per phase, and the real judge grades each seeded turn. Each phase must page **exactly** its own tripwire, and nothing else:
+
+```
+PASS  A. healthy baseline                    expected: none                                       got: none
+PASS  B. answer-quality regression           expected: judge_safety_violations, judge_score_mean  got: same
+PASS  C. provider failure (turn errored)     expected: turn_error_rate                            got: same
+PASS  D. latency regression (45s turn)       expected: turn_latency_p95                           got: same
+Step 7 checklist: PASS — every synthetic degradation fired exactly its own tripwire
+```
+
+In phases C and D, the incidents opened in B stay `BREACH` and are **not** re-paged. Drill alerts go to `backend/data/drill_alerts.jsonl` and never touch real incident state.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -251,4 +303,6 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 6: the judge runs offline, not in the request path.** Grading is a batch job (`run_step6_judge.py`, or `judge.run_judge(judge.collect_turns())`) over traces already in Phoenix. No live request waits for a grade.
 - **Step 6: the judge shares a model family with the agents.** It defaults to `claude-sonnet-5`, the same model as the specialists, which risks self-preference bias. Set `JUDGE_MODEL` to a different model to reduce it. The seeded pair still separates by 4.0 points.
 - **Step 6 bug fixed:** OpenInference records a tool's output as the whole serialised `ToolMessage` envelope, so the real result was pushed past the judge's 600-character window. The judge now unwraps it to the tool's actual content.
+- **Step 7: "paging" isn't a real on-call rotation.** A page is a line on stderr, an append to `backend/data/alerts.jsonl`, and, only if `PAGER_WEBHOOK_URL` is set, a JSON POST to that URL. A Slack incoming webhook or a PagerDuty Events endpoint would accept it. No webhook was configured for the recorded runs.
+- **Step 7: the daemon is a separate process,** not part of the gateway. It reads what the gateway, judge and job store have already written. Judge-based SLOs only move as fast as the judge runs, because grading is a batch job (Step 6).
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

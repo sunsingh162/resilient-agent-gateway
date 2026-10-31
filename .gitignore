@@ -14,3 +14,7 @@ venv/
 
 # Phase 4 — Step 5: local Phoenix trace store (PHOENIX_WORKING_DIR)
 backend/data/phoenix/
+
+# Phase 4 — Step 7: monitoring daemon state + alert logs
+backend/data/*.json
+backend/data/*.jsonl

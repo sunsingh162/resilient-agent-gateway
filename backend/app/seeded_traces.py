@@ -60,20 +60,27 @@ SEEDS = {
 }
 
 
-def emit_seeded_turn(kind: str) -> str:
-    """Writes one seeded turn as a trace and returns its trace_id (hex)."""
+def emit_seeded_turn(kind: str, *, label: str | None = None, status: str = "completed", latency_ms: int = 0) -> str:
+    """Writes one seeded turn as a trace and returns its trace_id (hex).
+
+    `kind` picks the content (good/bad). `status` and `latency_ms` let the
+    Step 7 drill seed an otherwise-good turn that errored or ran slow, to
+    prove the latency and error-rate tripwires fire on their own; `label`
+    (default: kind) is what lands in helpdesk.seeded.
+    """
     seed = SEEDS[kind]
+    label = label or kind
     tracer = get_tracer()
     attributes = {
         "openinference.span.kind": "CHAIN",
         "input.value": seed["ticket"],
         "output.value": seed["response"],
-        "session.id": f"seed-{kind}",
-        "helpdesk.thread_id": f"seed-{kind}",
+        "session.id": f"seed-{label}",
+        "helpdesk.thread_id": f"seed-{label}",
         "helpdesk.endpoint": "seed",
-        "helpdesk.status": "completed",
-        "helpdesk.seeded": kind,
-        "helpdesk.latency_ms": 0,
+        "helpdesk.status": status,
+        "helpdesk.seeded": label,
+        "helpdesk.latency_ms": latency_ms,
     }
     with tracer.start_as_current_span("helpdesk.turn", attributes=attributes) as turn:
         for tool_name, args, result in seed["tool_calls"]:
@@ -87,5 +94,5 @@ def emit_seeded_turn(kind: str) -> str:
                 },
             ):
                 pass
-        turn.set_status(Status(StatusCode.OK))
+        turn.set_status(Status(StatusCode.ERROR if status == "error" else StatusCode.OK))
         return format(turn.get_span_context().trace_id, "032x")

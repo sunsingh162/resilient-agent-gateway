@@ -19,12 +19,15 @@ def get_spans(
     name: str | None = None,
     trace_id: str | None = None,
     span_kind: str | None = None,
+    start_time: str | None = None,
     limit: int | None = None,
     base_url: str = PHOENIX_COLLECTOR_ENDPOINT,
     project: str = PHOENIX_PROJECT_NAME,
 ) -> list[dict]:
     """Newest first. Follows Phoenix's cursor pagination until `limit`
-    spans are collected or there are no more pages."""
+    spans are collected or there are no more pages. `start_time` (ISO 8601)
+    keeps only spans that started at or after it — the monitoring daemon's
+    rolling window (Step 7)."""
     params: dict = {"sort": "start_time", "order": "desc"}
     if name:
         params["name"] = name
@@ -32,6 +35,8 @@ def get_spans(
         params["trace_id"] = trace_id
     if span_kind:
         params["span_kind"] = span_kind
+    if start_time:
+        params["start_time"] = start_time
 
     spans: list[dict] = []
     cursor = None

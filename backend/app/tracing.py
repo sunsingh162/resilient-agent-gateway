@@ -68,6 +68,13 @@ def setup_tracing():
     return _tracer_provider
 
 
+def flush_tracing() -> None:
+    """Push buffered spans to Phoenix now, without shutting down — used by
+    scripts that write spans and then immediately read them back."""
+    if _tracer_provider is not None:
+        _tracer_provider.force_flush()
+
+
 def shutdown_tracing() -> None:
     """Flush buffered spans — BatchSpanProcessor would otherwise drop the
     last few seconds of spans when the process exits."""

@@ -97,11 +97,15 @@ def save_grade(turn: dict, verdict: dict, judge_model: str, db_path: str | None 
         conn.close()
 
 
-def recent_grades(limit: int = 50, db_path: str | None = None) -> list[dict]:
-    """Most recently graded first — the monitoring daemon (Step 7) reads this."""
+def recent_grades(limit: int = 50, since: str | None = None, db_path: str | None = None) -> list[dict]:
+    """Most recently graded first — the monitoring daemon (Step 7) reads
+    this, with `since` (ISO 8601) as its rolling window on graded_at."""
     conn = _get_connection(db_path)
     try:
-        rows = conn.execute("SELECT * FROM grades ORDER BY graded_at DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM grades WHERE graded_at >= ? ORDER BY graded_at DESC LIMIT ?",
+            (since or "", limit),
+        ).fetchall()
         grades = []
         for row in rows:
             grade = dict(row)

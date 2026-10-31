@@ -114,11 +114,15 @@ def get_job(job_id: str, db_path: str | None = None) -> dict | None:
         conn.close()
 
 
-def list_jobs(limit: int = 50, db_path: str | None = None) -> list[dict]:
-    """Most recent first — the monitoring daemon (Step 7) reads this."""
+def list_jobs(limit: int = 50, since: str | None = None, db_path: str | None = None) -> list[dict]:
+    """Most recent first — the monitoring daemon (Step 7) reads this, with
+    `since` (ISO 8601) as its rolling window on created_at."""
     conn = _get_connection(db_path)
     try:
-        rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (since or "", limit),
+        ).fetchall()
         return [_row_to_job(row) for row in rows]
     finally:
         conn.close()
