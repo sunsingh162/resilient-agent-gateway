@@ -26,6 +26,18 @@ python -m pytest tests/ -q        # deterministic tests pass with no key; live o
 python scripts/run_swarm.py       # Step 1: one full swarm run from a plain script
 ```
 
+**Run the full stack** in two terminals from the repo root, with the venv active in each:
+
+```bash
+# Terminal 1: Phoenix trace UI and collector on :6006 (first start takes ~15s)
+PHOENIX_WORKING_DIR=backend/data/phoenix phoenix serve
+
+# Terminal 2: the gateway on :8000
+cd backend && uvicorn app.main:app --port 8000
+```
+
+Phoenix is optional. If it isn't running, the gateway works normally and tracing just drops its spans.
+
 ---
 
 ## Phase 4 build: one step per commit
@@ -36,7 +48,7 @@ python scripts/run_swarm.py       # Step 1: one full swarm run from a plain scri
 | 2 | Gateway + sync endpoint | `POST /analyze` (blocks until the swarm finishes or pauses at HITL) + `phase4_live_step` on `/health` | ✅ |
 | 3 | Streaming (SSE) | `POST /analyze/stream`: 9 typed events (`stream_schemas.py`), including tool calls from inside the parallel specialists while they run | ✅ |
 | 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}`. Jobs are stored in SQLite, so results survive client disconnects and server restarts | ✅ |
-| 5 | Tracing | OpenTelemetry spans → Arize Phoenix | ⏳ |
+| 5 | Tracing | OpenTelemetry → Arize Phoenix: a root `helpdesk.turn` span per request, plus one span per graph node, LLM call and tool call, including inside the parallel specialists | ✅ |
 | 6 | LLM-as-judge | Grade traces on 2+ axes | ⏳ |
 | 7 | Monitoring daemon | Named SLOs + paging tripwires | ⏳ |
 | 8 | Semantic cache | Embedding cache + cost model | ⏳ |
@@ -138,6 +150,39 @@ Recorded run: 202 returned in **4ms**. An immediate poll showed `running`. The n
 - **Finished jobs survive a server restart.** I stopped uvicorn, started it again, and polled the same `job_id`: still `completed`, with the full result.
 - **A job killed mid-run doesn't hang.** I submitted a job, stopped the server while it was `running`, and restarted it. The startup hook logs `marked 1 job(s) from a previous process as failed`, and polling returns `failed` with the error `server restarted before this job finished — resubmit it`.
 
+### Tracing (Step 5)
+
+Open **http://localhost:6006** and choose project **`resilient-agent-gateway`**. Each `/analyze`, `/analyze/stream` or `/analyze/async` call produces one trace:
+
+```
+POST /analyze                                  ← FastAPI's native HTTP span
+└─ helpdesk.turn                               ← gateway root span (app/tracing.py)
+   └─ LangGraph                                ← OpenInference LangChainInstrumentor from here down
+      ├─ triage → ingress, classify (ChatAnthropic), summarize
+      ├─ determine_categories (ChatAnthropic)
+      ├─ parallel_specialist_worker [network]
+      │  └─ LangGraph → agent (ChatAnthropic) → tools → search_kb, assess_severity …
+      ├─ parallel_specialist_worker [account]
+      │  └─ LangGraph → agent → tools → lookup_student_account, create_ticket …
+      ├─ hitl_gate
+      └─ synthesizer (ChatAnthropic) → egress
+```
+
+`helpdesk.turn` carries the attributes that Steps 6 and 7 query: `helpdesk.endpoint`, `helpdesk.thread_id` (also `session.id`), `helpdesk.status`, `helpdesk.latency_ms`, `helpdesk.category`, `helpdesk.dispatch_categories`, `helpdesk.escalated`, `input.value` and `output.value`. A turn that raises ends with status `ERROR` and an `exception` event.
+
+**Step 5 checklist (a real run shows nested spans, not one flat span).** Recorded from real runs, read back from Phoenix's REST API:
+
+| Endpoint | Spans in trace | LLM spans | Tool spans | Path to a tool span |
+|---|---|---|---|---|
+| `/analyze` (2 specialists, paused for approval) | 64 | 10 | 8 | `create_ticket ← tools ← LangGraph ← parallel_specialist_worker ← LangGraph ← helpdesk.turn ← POST /analyze` |
+| `/analyze/stream` (1 specialist, completed) | 36 | 5 | 2 | `assess_severity ← tools ← LangGraph ← parallel_specialist_worker ← LangGraph ← helpdesk.turn ← POST /analyze/stream` |
+| `/analyze/async` (failed: out of API credit) | 10 | 1 | 0 | Trace status `ERROR`, with Anthropic's 400 message on the span |
+
+**Three tracing problems found and fixed during this step:**
+- **Every LLM call was traced twice.** The Anthropic SDK now emits its own `anthropic.messages.create` span whenever a global tracer provider exists, on top of OpenInference's `ChatAnthropic` span. That would double-count tokens and cost in Steps 7 to 9. Fixed with `ANTHROPIC_OPEN_TELEMETRY=false`, which `tracing.setup_tracing()` sets. Now there are 0 duplicate spans.
+- **The stream raised `Failed to detach context`.** Starlette runs each `next()` of a sync generator on a different threadpool worker, so a span opened inside the generator got closed in another thread's context. Fixed by running the turn on one producer thread that holds the span and hands events over through a queue. The thread starts in a copy of the request's context, so the stream's trace hangs under its `POST /analyze/stream` span. Now there are 0 errors in the gateway log.
+- **Trace noise.** FastAPI's native telemetry added `fastapi.dependencies` and `fastapi.serialization` spans to every request, plus a one-span trace for every `GET /jobs` poll and `/health` check. Per-operation spans are off, and those two paths are excluded. I verified 3 polls plus 3 health checks added 0 traces.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -162,4 +207,6 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Approvals stream one at a time.** `hitl_gate` interrupts once per drafted write, so a stream ends at the *first* `approval_required`. The remaining drafts surface on the next resume through `/approvals/{thread_id}/approve`, exactly as in Phase 3.
 - **Step 4's queue is in-process, not a broker.** Jobs run on a `ThreadPoolExecutor` inside the API process. The job *record* is durable (SQLite), but a job that is mid-run when the process dies is lost and gets marked `failed`. It isn't retried. A broker-backed queue (Celery, RQ, Arq) would hand it to another worker instead. That was out of scope here because the swarm, its checkpointer and its approval registry all already live in this one process.
 - **An async job that pauses for approval stays `awaiting_approval`.** Resolving it through `/approvals/{thread_id}/*` finishes the conversation but doesn't update the job record. The job's `result.thread_id` is the handle for continuing it.
+- **Step 5: async jobs start their own trace.** `/analyze/async` returns its 202 and closes its HTTP span before the job runs, so the job's `helpdesk.turn` is a root span on the worker thread. It's tagged `helpdesk.endpoint=/analyze/async`. Sync and stream turns are children of their HTTP span.
+- **Step 5: the approval endpoints have no `helpdesk.turn` span.** `/approvals/{thread_id}/*` resumes are still traced by OpenInference, because their graph runs appear in Phoenix, but they don't get the gateway's root span or `helpdesk.*` attributes.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

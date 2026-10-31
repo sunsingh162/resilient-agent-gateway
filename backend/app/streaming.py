@@ -17,6 +17,9 @@ message id and emitted once the final chunk arrives, so a client gets one
 complete tool_call event with parsed args, not a trickle of JSON fragments.
 """
 
+import contextvars
+import queue
+import threading
 import time
 from collections.abc import Iterator
 
@@ -36,6 +39,7 @@ from .stream_schemas import (
     ToolCall,
     ToolResult,
 )
+from .tracing import record_turn_result, turn_span
 
 # The one decision each node made that's worth showing on a handoff event.
 _HANDOFF_DETAIL_KEYS = ("category", "dispatch_categories", "injection_blocked", "escalated", "write_outcomes")
@@ -47,6 +51,51 @@ def _handoff_detail(update: dict) -> dict:
 
 
 def stream_analysis(thread_id: str, message: str) -> Iterator[StreamEvent]:
+    """Step 5: runs the turn on one dedicated producer thread, inside the
+    turn's root span, and hands events to the HTTP layer through a queue.
+
+    Why a thread: Starlette iterates a sync generator by calling next() on
+    whichever threadpool worker is free, each with a fresh copy of the
+    context. A span opened inside the generator would be attached in one
+    context and detached in another ("Failed to detach context"), and the
+    instrumentor's child spans would lose their parent. One thread owning
+    the whole turn keeps the span's context in one place. Side effect, and
+    the right one for a helpdesk: a client that disconnects mid-stream
+    doesn't abort the turn — it still finishes and gets checkpointed.
+    """
+    events: queue.Queue = queue.Queue()
+
+    def produce() -> None:
+        summary: dict = {}
+        status = "error"
+        start = time.monotonic()
+        try:
+            with turn_span("/analyze/stream", thread_id, message) as span:
+                for event in _stream_events(thread_id, message):
+                    if isinstance(event, AgentHandoff):
+                        summary.update({k: v for k, v in event.detail.items() if k in ("category", "dispatch_categories", "escalated")})
+                    elif isinstance(event, FinalAnswer):
+                        summary["response"] = event.response
+                    elif isinstance(event, Done):
+                        status = event.status
+                    events.put(event)
+                record_turn_result(span, status, int((time.monotonic() - start) * 1000), summary)
+        finally:
+            events.put(_END_OF_STREAM)
+
+    # Run the producer inside a copy of the caller's context, so the turn's
+    # root span is parented to the POST /analyze/stream HTTP span the same
+    # way /analyze's is, instead of starting a separate trace.
+    request_context = contextvars.copy_context()
+    threading.Thread(target=request_context.run, args=(produce,), name=f"stream-{thread_id}", daemon=True).start()
+    while (event := events.get()) is not _END_OF_STREAM:
+        yield event
+
+
+_END_OF_STREAM = object()
+
+
+def _stream_events(thread_id: str, message: str) -> Iterator[StreamEvent]:
     start = time.monotonic()
     seq = 0
 

@@ -23,7 +23,7 @@ def _isolated_jobs_db(tmp_path, monkeypatch):
 
 
 def _canned_turn(status="completed", response="Rejoin CampusSecure.", gate: threading.Event | None = None):
-    def turn(thread_id: str, message: str) -> main.AnalyzeResponse:
+    def turn(thread_id: str, message: str, endpoint: str = "/analyze") -> main.AnalyzeResponse:
         if gate is not None:
             gate.wait(timeout=5)
         return main.AnalyzeResponse(
@@ -91,7 +91,7 @@ def test_paused_turn_lands_as_awaiting_approval(monkeypatch):
 
 
 def test_a_failing_turn_is_recorded_as_failed_with_the_error(monkeypatch):
-    def boom(thread_id, message):
+    def boom(thread_id, message, endpoint="/analyze"):
         raise RuntimeError("anthropic 529 overloaded")
 
     monkeypatch.setattr(main, "_analyze_turn", boom)

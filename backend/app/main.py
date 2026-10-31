@@ -19,19 +19,35 @@ from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stre
 from . import job_queue, job_store  # noqa: E402
 from .stream_schemas import to_sse  # noqa: E402
 from .streaming import stream_analysis  # noqa: E402
+from .tracing import record_turn_result, setup_tracing, shutdown_tracing, turn_span  # noqa: E402
 
 logger = logging.getLogger("gateway")
 
 
+def _is_untraced_path(path: str) -> bool:
+    return path == "/health" or path.startswith("/jobs/")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_tracing()
     orphaned = job_store.fail_orphaned_jobs()
     if orphaned:
         logger.warning("[gateway] marked %d job(s) from a previous process as failed", orphaned)
     yield
+    shutdown_tracing()
 
 
-app = FastAPI(title="Resilient Agent Gateway — Campus IT Helpdesk Swarm", lifespan=lifespan)
+app = FastAPI(
+    title="Resilient Agent Gateway — Campus IT Helpdesk Swarm",
+    lifespan=lifespan,
+    # FastAPI's native OTel: keep the per-request HTTP span (it parents the
+    # helpdesk.turn span), drop the per-operation dependencies/serialization
+    # spans that add a few dozen rows of noise to every trace, and skip
+    # health checks and job polls entirely — a client polling /jobs every 2s
+    # would otherwise bury the real agent traces in one-span GET traces.
+    telemetry={"operation_spans": False, "exclude": lambda scope: _is_untraced_path(scope.get("path", ""))},
+)
 
 # Dev-only convenience: the minimal frontend (frontend/index.html) is a
 # static file with no build step, typically opened straight from disk or
@@ -144,11 +160,16 @@ class JobStatus(BaseModel):
     error: Optional[str]
 
 
-def _analyze_turn(thread_id: str, message: str) -> AnalyzeResponse:
-    start = time.monotonic()
-    result = run_ticket(thread_id, message)
-    latency_ms = int((time.monotonic() - start) * 1000)
-    return _to_analyze_response(thread_id, result, latency_ms)
+def _analyze_turn(thread_id: str, message: str, endpoint: str = "/analyze") -> AnalyzeResponse:
+    # The root span is opened here, not in the endpoint, so an async job's
+    # trace is rooted on the worker thread that actually runs the swarm.
+    with turn_span(endpoint, thread_id, message) as span:
+        start = time.monotonic()
+        result = run_ticket(thread_id, message)
+        latency_ms = int((time.monotonic() - start) * 1000)
+        response = _to_analyze_response(thread_id, result, latency_ms)
+        record_turn_result(span, response.status, latency_ms, response.model_dump())
+        return response
 
 
 def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
@@ -164,7 +185,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 4
+PHASE4_LIVE_STEP = 5
 
 
 @app.get("/health")
@@ -193,7 +214,9 @@ def analyze_async(payload: AnalyzeRequest) -> JobAccepted:
     """
     thread_id = payload.thread_id or f"job-thread-{uuid.uuid4()}"
     message = payload.message
-    job, _ = job_queue.submit(thread_id, message, lambda: _analyze_turn(thread_id, message).model_dump())
+    job, _ = job_queue.submit(
+        thread_id, message, lambda: _analyze_turn(thread_id, message, endpoint="/analyze/async").model_dump()
+    )
     return JobAccepted(
         job_id=job["job_id"],
         thread_id=thread_id,
