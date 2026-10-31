@@ -21,3 +21,6 @@ arize-phoenix-otel>=0.17.2,<1.0.0
 openinference-instrumentation-langchain>=0.1.81,<0.2.0
 opentelemetry-sdk>=1.45.2,<2.0.0
 opentelemetry-exporter-otlp-proto-http>=1.45.2,<2.0.0
+
+# Phase 4 — Step 8: semantic cache (local CPU embeddings)
+fastembed>=0.9.1,<1.0.0

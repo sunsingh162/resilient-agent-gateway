@@ -16,7 +16,7 @@ load_dotenv()
 from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
-from . import job_queue, job_store  # noqa: E402
+from . import cost_model, job_queue, job_store, semantic_cache  # noqa: E402
 from .stream_schemas import to_sse  # noqa: E402
 from .streaming import stream_analysis  # noqa: E402
 from .tracing import record_turn_result, setup_tracing, shutdown_tracing, turn_span  # noqa: E402
@@ -99,6 +99,12 @@ class PendingWrite(BaseModel):
     draft: dict
 
 
+class CacheInfo(BaseModel):
+    status: Literal["hit", "miss", "bypass"]
+    reason: str
+    similarity: Optional[float] = None
+
+
 class AnalyzeResponse(BaseModel):
     thread_id: str
     # completed: the swarm finished and `response` is final.
@@ -111,6 +117,10 @@ class AnalyzeResponse(BaseModel):
     pending_writes: list[PendingWrite]
     escalated: bool
     latency_ms: int
+    # Step 8: the semantic cache's decision for this turn, and what the turn
+    # actually cost in API spend (0 on a cache hit).
+    cache: Optional[CacheInfo] = None
+    cost_usd: Optional[float] = None
 
 
 def _pending_writes(result: dict) -> list[PendingWrite]:
@@ -160,14 +170,48 @@ class JobStatus(BaseModel):
     error: Optional[str]
 
 
+_CACHE_VOLATILE_FIELDS = {"thread_id", "latency_ms", "cache", "cost_usd"}
+
+
+def _is_new_thread(thread_id: str) -> bool:
+    snapshot = get_compiled_graph().get_state({"configurable": {"thread_id": thread_id}})
+    return not snapshot.values.get("messages")
+
+
 def _analyze_turn(thread_id: str, message: str, endpoint: str = "/analyze") -> AnalyzeResponse:
     # The root span is opened here, not in the endpoint, so an async job's
     # trace is rooted on the worker thread that actually runs the swarm.
+    # Step 8: the semantic cache sits here too, so /analyze and
+    # /analyze/async share it (scope rules in semantic_cache.py).
     with turn_span(endpoint, thread_id, message) as span:
         start = time.monotonic()
-        result = run_ticket(thread_id, message)
+        decision = semantic_cache.lookup(message, is_new_thread=_is_new_thread(thread_id))
+        cache_info = CacheInfo(status=decision.status, reason=decision.reason, similarity=decision.similarity)
+        span.set_attribute("helpdesk.cache", decision.status)
+
+        if decision.status == "hit":
+            latency_ms = int((time.monotonic() - start) * 1000)
+            response = AnalyzeResponse(
+                **decision.cached_response,
+                thread_id=thread_id,
+                latency_ms=latency_ms,
+                cache=cache_info,
+                cost_usd=0.0,
+            )
+            span.set_attribute("helpdesk.cache.similarity", decision.similarity)
+            record_turn_result(span, response.status, latency_ms, response.model_dump())
+            return response
+
+        with cost_model.measure_turn() as usage:
+            result = run_ticket(thread_id, message)
         latency_ms = int((time.monotonic() - start) * 1000)
         response = _to_analyze_response(thread_id, result, latency_ms)
+        response.cache = cache_info
+        response.cost_usd = round(usage.cost_usd, 6)
+        semantic_cache.finish(
+            decision, message, response.model_dump(exclude=_CACHE_VOLATILE_FIELDS), usage.cost_usd, latency_ms
+        )
+        span.set_attribute("helpdesk.cost_usd", usage.cost_usd)
         record_turn_result(span, response.status, latency_ms, response.model_dump())
         return response
 
@@ -185,7 +229,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 5
+PHASE4_LIVE_STEP = 8
 
 
 @app.get("/health")
@@ -223,6 +267,12 @@ def analyze_async(payload: AnalyzeRequest) -> JobAccepted:
         status=job["status"],
         poll_url=f"/jobs/{job['job_id']}",
     )
+
+
+@app.get("/cache/stats")
+def cache_stats() -> dict:
+    """Phase 4 Step 8: semantic cache hit rate and the cost model's dollars saved."""
+    return semantic_cache.stats()
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatus)

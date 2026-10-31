@@ -51,7 +51,7 @@ Phoenix is optional. If it isn't running, the gateway works normally and tracing
 | 5 | Tracing | OpenTelemetry → Arize Phoenix: a root `helpdesk.turn` span per request, plus one span per graph node, LLM call and tool call, including inside the parallel specialists | ✅ |
 | 6 | LLM-as-judge | Pulls finished turns from Phoenix and grades correctness, safety and tool use (1–5). Scores are written back to Phoenix as annotations and to `judge.db` | ✅ |
 | 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
-| 8 | Semantic cache | Embedding cache + cost model | ⏳ |
+| 8 | Semantic cache | Local-embedding cache in front of `/analyze` and `/analyze/async`. Personal tickets are never cached. A measured per-turn cost model and `GET /cache/stats` (hit rate, $ saved) | ✅ |
 | 9 | Model router | Per-agent cost tiers + budget | ⏳ |
 | 10 | Fallback cascade | Tier-keyed cascade + circuit breaker + mid-stream hot-swap | ⏳ |
 | 11 | Failure drill | Self-contained "cut cable" script + cascade tripwires | ⏳ |
@@ -74,6 +74,7 @@ Interactive docs are at `http://localhost:8000/docs`.
 | `POST /analyze` | 2 | Sync. Sends a ticket and blocks until the swarm finishes the turn. `thread_id` is optional: omit it to start a new conversation. |
 | `POST /analyze/stream` | 3 | Same turn as `/analyze`, streamed as Server-Sent Events |
 | `POST /analyze/async` | 4 | Returns `202 Accepted` with a `job_id` immediately and runs the turn on a worker pool |
+| `GET /cache/stats` | 8 | Semantic cache hit rate, $ spent, $ saved, savings %, latency saved, and a monthly projection |
 | `GET /jobs/{job_id}` | 4 | Job status (`queued → running → completed / awaiting_approval / blocked / failed`). Once finished, `result` has the same shape as the `/analyze` response. Unknown IDs return `404` |
 | `GET /health` | 2 | Liveness check, plus `phase4_live_step`: the highest step that is live-wired into request handling |
 | `POST /approvals/{thread_id}/approve` · `/deny` · `/edit-approve` | Phase 3 | Resolve a write paused at the HITL gate |
@@ -274,6 +275,58 @@ Step 7 checklist: PASS — every synthetic degradation fired exactly its own tri
 
 In phases C and D, the incidents opened in B stay `BREACH` and are **not** re-paged. Drill alerts go to `backend/data/drill_alerts.jsonl` and never touch real incident state.
 
+### Semantic cache and cost model (Step 8)
+
+**Cache scope (where it's wired, and why):** the cache sits in `main._analyze_turn`, the one function behind both `POST /analyze` and `POST /analyze/async`, so both paths share one cache. It's **not** on `/analyze/stream`. A cached answer has no handoffs or tool calls to stream, and replaying fake events would misrepresent what ran.
+
+For a helpdesk, *what* may be cached is a privacy decision before it's a performance one:
+
+| Request | Cache decision | Why |
+|---|---|---|
+| First turn of a generic ticket ("Wi-Fi drops in the library") | lookup → **hit or miss** | The answer is the same for everyone |
+| Names a student ID (`S1002`) | **bypass** | The answer depends on that student's account. Serving S1002's lock status to S1003 would be a privacy breach |
+| Contains an email, phone or card number | **bypass** | Reuses `redact_pii()` from the Phase 3 guardrails |
+| Follow-up on an existing thread | **bypass** | The answer depends on that thread's history |
+| Prompt-injection attempt | **bypass** | The ingress guardrail handles it |
+
+Only **clean, completed** turns are stored. A turn paused for approval, escalated or blocked is a per-incident action, never a reusable answer.
+
+**Matching.** `BAAI/bge-small-en-v1.5` embeddings run locally on CPU through `fastembed`, at about 7ms per ticket. No API key is needed, and the model downloads once (about 67MB) into `backend/data/models/`. Each new ticket is compared by cosine similarity against unexpired entries for the current `CACHE_POLICY_VERSION`. The 0.92 threshold was calibrated on real helpdesk tickets:
+
+| Compared with "My Wi-Fi keeps dropping every few minutes in the library. Any fix?" | Cosine |
+|---|---|
+| Same text, different case and punctuation | 0.989 |
+| Paraphrase: "Wi-Fi in the library disconnects every couple of minutes - how do I fix it?" | 0.951 |
+| Same ticket plus "is my account S1002 locked?" | 0.876 |
+| Unrelated (printer jam, password reset) | ~0.57 |
+
+Bump `CACHE_POLICY_VERSION` when KB articles or prompts change, so answers written under the old policy stop matching. Entries also expire after `CACHE_TTL_HOURS` (default 24).
+
+**Cost model (`app/cost_model.py`).** Every turn's real token usage is captured per model with LangChain's `get_usage_metadata_callback`, including the nested specialist subgraphs. It's priced at Anthropic's per-MTok rates: Sonnet 5 at $2 in / $10 out, Haiku 4.5 at $1 / $5. I checked the measurement against Phoenix. For the printer turn the gateway measured **$0.0387**, and recomputing from that trace's 6 LLM spans in Phoenix (Sonnet 8,516 in + 2,071 out, Haiku 813 in + 33 out) gives **$0.0387**. A hit records the original turn's cost and latency as saved.
+
+**Step 8 checklist (the same question twice is measurably faster the second time, and the stats increment).** Recorded run on a cleared cache:
+
+| # | Request | Cache | Latency | Cost |
+|---|---|---|---|---|
+| 1 | "My Wi-Fi keeps dropping every few minutes in the library. Any fix?" | miss (cache empty) | 39.86s | $0.0247 |
+| 2 | **Same question again** | **hit**, similarity 1.000 | **0.01s** | **$0** |
+| 3 | Paraphrase: "Wi-Fi in the library disconnects every couple of minutes…" | **hit**, 0.951 | 0.01s | $0 |
+| 4 | "My Wi-Fi keeps dropping in the library, my student ID is S1002" | **bypass**: names a student ID | 18.11s | $0.0373, ended `awaiting_approval` |
+| 5 | "The printer in lab B2 is jammed…" | miss, best match 0.580 | 26.97s | $0.0387 |
+| 6 | Paraphrase via **`/analyze/async`** | **hit**, 0.943 | 11ms | $0 |
+
+`GET /cache/stats` after those six requests:
+
+```json
+{"lookups": 6, "hits": 3, "misses": 2, "bypasses": 1,
+ "hit_rate_cacheable": 0.6, "hit_rate_overall": 0.5,
+ "spent_usd": 0.100673, "saved_usd": 0.07404, "spend_without_cache_usd": 0.174713, "savings_pct": 42.38,
+ "latency_saved_ms": 119562, "projected_monthly_saved_usd": 246.8,
+ "projection_basis": "20000 turns/month at this window's savings per turn"}
+```
+
+The first request's 39.9s is slower than a typical miss (13–22s in earlier steps), most likely because of the first embedding-model load plus a slow API response. The hit latency doesn't depend on it either way.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -305,4 +358,8 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 6 bug fixed:** OpenInference records a tool's output as the whole serialised `ToolMessage` envelope, so the real result was pushed past the judge's 600-character window. The judge now unwraps it to the tool's actual content.
 - **Step 7: "paging" isn't a real on-call rotation.** A page is a line on stderr, an append to `backend/data/alerts.jsonl`, and, only if `PAGER_WEBHOOK_URL` is set, a JSON POST to that URL. A Slack incoming webhook or a PagerDuty Events endpoint would accept it. No webhook was configured for the recorded runs.
 - **Step 7: the daemon is a separate process,** not part of the gateway. It reads what the gateway, judge and job store have already written. Judge-based SLOs only move as fast as the judge runs, because grading is a batch job (Step 6).
+- **Step 8: a cache hit creates no conversation history.** A hit returns the stored answer on the caller's `thread_id` without running the graph, so nothing is checkpointed for that thread. A follow-up on it starts as a fresh conversation, and because it's then a "first turn", it's cache-eligible again.
+- **Step 8: the cache search is a linear scan.** It holds every unexpired entry for the policy version in SQLite and compares them all. That's fine for hundreds or thousands of entries. A vector index (FAISS, sqlite-vec) would replace it at real scale.
+- **Step 8: the monthly projection is an extrapolation,** not a forecast. It's this window's savings per turn × `COST_MODEL_MONTHLY_TURNS` (default 20,000). The 42% savings rate comes from a 6-request demo built to show hits, not from real traffic.
+- **Step 8 touched one Phase 3 test file.** `tests/conftest.py` gained an autouse fixture that points the cache at a per-test temp database and turns it off by default, so existing tests never share or pollute a cache. It's an addition only.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

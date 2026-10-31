@@ -18,3 +18,6 @@ backend/data/phoenix/
 # Phase 4 — Step 7: monitoring daemon state + alert logs
 backend/data/*.json
 backend/data/*.jsonl
+
+# Phase 4 — Step 8: downloaded embedding model (fastembed, ~67MB)
+backend/data/models/
