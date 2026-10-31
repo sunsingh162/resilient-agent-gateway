@@ -4,6 +4,7 @@ import os
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, SystemMessage
 
+from ... import model_router
 from ...tools.crm import lookup_student_account
 from ...tools.kb import search_kb
 from ...tools.severity import assess_severity
@@ -14,16 +15,11 @@ TOOLS = [lookup_student_account, search_kb, assess_severity, create_ticket]
 
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "6"))
 
-_llm: ChatAnthropic | None = None
-
-
 def get_agent_llm() -> ChatAnthropic:
-    global _llm
-    if _llm is None:
-        # claude-sonnet-5 (and newer Claude 5 family models) reject an explicit
-        # `temperature` value — deprecated for this model, so we omit it.
-        _llm = ChatAnthropic(model=os.getenv("AGENT_MODEL", "claude-sonnet-5"))
-    return _llm
+    # Phase 4 Step 9: model comes from the router — "specialist" agent,
+    # "standard" tier (claude-sonnet-5) by default. claude-sonnet-5 and newer
+    # Claude 5 models reject an explicit `temperature`, so none is set.
+    return model_router.get_llm("specialist")
 
 
 SYSTEM_PROMPT = (

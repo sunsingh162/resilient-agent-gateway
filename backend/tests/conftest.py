@@ -22,3 +22,17 @@ def _isolated_semantic_cache(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SEMANTIC_CACHE_DB_PATH", str(tmp_path / "semantic_cache.db"))
     monkeypatch.setattr(semantic_cache, "CACHE_ENABLED", False)
+
+
+# Phase 4, Step 9: every LLM call now goes through the model router, which
+# writes a ledger row per call. Point the ledger at a per-test tmp DB and
+# reset tier assignments, so tests never write to backend/data and one
+# test's tier change or spend can't leak into another.
+@pytest.fixture(autouse=True)
+def _isolated_model_router(tmp_path, monkeypatch):
+    from app import model_router
+
+    monkeypatch.setenv("ROUTER_LEDGER_DB_PATH", str(tmp_path / "router_ledger.db"))
+    model_router.reset_assignments()
+    yield
+    model_router.reset_assignments()

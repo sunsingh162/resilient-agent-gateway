@@ -52,7 +52,7 @@ Phoenix is optional. If it isn't running, the gateway works normally and tracing
 | 6 | LLM-as-judge | Pulls finished turns from Phoenix and grades correctness, safety and tool use (1–5). Scores are written back to Phoenix as annotations and to `judge.db` | ✅ |
 | 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
 | 8 | Semantic cache | Local-embedding cache in front of `/analyze` and `/analyze/async`. Personal tickets are never cached. A measured per-turn cost model and `GET /cache/stats` (hit rate, $ saved) | ✅ |
-| 9 | Model router | Per-agent cost tiers + budget | ⏳ |
+| 9 | Model router | Each of 6 agents → one of 4 cost tiers → a model, chosen on every call. Per-tier USD budgets with automatic downgrade. Every call's tokens and cost go to a ledger. `GET /router/status`, `PUT /router/agents/{agent}` | ✅ |
 | 10 | Fallback cascade | Tier-keyed cascade + circuit breaker + mid-stream hot-swap | ⏳ |
 | 11 | Failure drill | Self-contained "cut cable" script + cascade tripwires | ⏳ |
 | 12 | Wiring audit | Live-wired vs standalone honesty table | ⏳ |
@@ -74,6 +74,8 @@ Interactive docs are at `http://localhost:8000/docs`.
 | `POST /analyze` | 2 | Sync. Sends a ticket and blocks until the swarm finishes the turn. `thread_id` is optional: omit it to start a new conversation. |
 | `POST /analyze/stream` | 3 | Same turn as `/analyze`, streamed as Server-Sent Events |
 | `POST /analyze/async` | 4 | Returns `202 Accepted` with a `job_id` immediately and runs the turn on a worker pool |
+| `GET /router/status` | 9 | Each agent's assigned and effective tier and model, plus each tier's spend, budget and remaining in the rolling window |
+| `PUT /router/agents/{agent}` | 9 | `{"tier": "frontier"}` reassigns one agent at runtime and takes effect on its next LLM call. `404` for an unknown agent, `422` for an unknown tier |
 | `GET /cache/stats` | 8 | Semantic cache hit rate, $ spent, $ saved, savings %, latency saved, and a monthly projection |
 | `GET /jobs/{job_id}` | 4 | Job status (`queued → running → completed / awaiting_approval / blocked / failed`). Once finished, `result` has the same shape as the `/analyze` response. Unknown IDs return `404` |
 | `GET /health` | 2 | Liveness check, plus `phase4_live_step`: the highest step that is live-wired into request handling |
@@ -327,6 +329,58 @@ Bump `CACHE_POLICY_VERSION` when KB articles or prompts change, so answers writt
 
 The first request's 39.9s is slower than a typical miss (13–22s in earlier steps), most likely because of the first embedding-model load plus a slow API response. The hit latency doesn't depend on it either way.
 
+### Dynamic model router (Step 9)
+
+Every LLM call site in the swarm now asks `app/model_router.py` for its model **by agent name**. The router maps agent → cost tier → model, and resolves it on **every call**, so a tier change or a budget downgrade applies to the very next request.
+
+| Tier | Model | $ / MTok (in / out) | Budget (rolling 24h) |
+|---|---|---|---|
+| economy | `claude-haiku-5-5` | 0.10 / 0.50 | $1 |
+| utility | `claude-haiku-4-5` | 1.00 / 5.00 | $2 |
+| standard | `claude-sonnet-5` | 2.00 / 10.00 | $10 |
+| frontier | `claude-opus-5-5` | 4.00 / 20.00 | $5 |
+
+| Agent (call site) | Default tier |
+|---|---|
+| `classify` (`nodes/classify.py`), `summarize` (`nodes/context.py`) | utility |
+| `dispatcher`, `synthesizer` (`nodes/dispatcher.py`), `specialist` (`nodes/agent.py`), `supervisor` (`nodes/supervisor.py`) | standard |
+
+**The defaults reproduce the pre-router swarm exactly,** so the router changes nothing until someone changes a tier. `CLASSIFY_MODEL` and `AGENT_MODEL` are still honoured as the utility and standard models.
+
+**Ways to change a tier:** set `ROUTER_AGENT_TIERS` at startup, call `PUT /router/agents/{agent}` at runtime, or call `model_router.set_agent_tier()` in code.
+
+**Budget tracking.** Each tier is a virtual key with a rolling-window USD budget. A LangChain callback on every routed model writes the call's **real** token usage to `router_ledger.db`: agent, requested tier, effective tier, model, input and output tokens, priced by Step 8's cost model, and the LangGraph `thread_id`. When a tier's spend reaches its budget, its agents route to the **next cheaper tier that still has budget**, and the downgrade is logged. If every tier at or below the request is spent, the agent runs on the cheapest tier anyway rather than failing the student's request. The overrun shows in `/router/status`.
+
+**Trace confirmation.** Each routed model carries `{router.agent, router.tier, router.requested_tier}` metadata. OpenInference copies it onto the LLM span, and Phoenix's REST API returns it as `metadata.router.agent` and so on, next to the `llm.model_name` the instrumentor records independently.
+
+**Step 9 checklist (swapping an agent's tier visibly changes which model handles its calls, confirmed via the trace):**
+
+```bash
+cd backend && python scripts/run_step9_router.py     # needs Phoenix running + API key
+```
+
+The same ticket ("projector shows no signal over HDMI") ran three times, each on a fresh thread. Recorded run, read from the router's ledger:
+
+| Run | Tiers | classify | specialist | dispatcher / synthesizer | Turn cost |
+|---|---|---|---|---|---|
+| A | defaults | `claude-haiku-4-5` ($0.00099) | `claude-sonnet-5` ×3 calls | `claude-sonnet-5` | $0.0303 |
+| B | specialist→**frontier**, classify→**economy** | **`claude-haiku-5-5`** ($0.00009) | **`claude-opus-5-5`** ×2 calls | `claude-sonnet-5` (untouched) | $0.0418 |
+| C | as B, frontier budget forced to $0 | `claude-haiku-5-5` | **assigned frontier → routed `claude-sonnet-5`** ×4 calls | `claude-sonnet-5` | $0.0343 |
+
+In **Phoenix's own LLM spans** for run B, `llm.model_name` grouped by `metadata.router.agent` shows: `classify ['claude-haiku-5-5']`, `dispatcher ['claude-sonnet-5']`, `specialist ['claude-opus-5-5']`, `synthesizer ['claude-sonnet-5']`. That matches the ledger exactly. All 7 checks pass:
+
+```
+PASS  A: specialist on standard tier            PASS  B: untouched agents unchanged
+PASS  A: classify on utility tier               PASS  B: Phoenix spans agree with the ledger
+PASS  B: specialist moved to frontier           PASS  C: over-budget frontier downgraded to standard
+PASS  B: classify moved to economy
+Step 9 checklist: PASS — tier swaps change the serving model, confirmed in Phoenix
+```
+
+**Two findings from the run:**
+- **Classify on the economy tier costs 11× less** for the same result: `claude-haiku-5-5` at $0.00009 against `claude-haiku-4-5` at $0.00099 per classification, and both returned the same category. Moving `utility` to Haiku 5.5 is the obvious next saving. It's left as an explicit decision rather than a silent default change.
+- **The frontier specialist used fewer calls** (2 against 3–4 on Sonnet 5) but cost more per call. That makes the turn 38% dearer overall ($0.0418 against $0.0303). Cost per completed turn, not per call, is the number to watch.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -362,4 +416,8 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 8: the cache search is a linear scan.** It holds every unexpired entry for the policy version in SQLite and compares them all. That's fine for hundreds or thousands of entries. A vector index (FAISS, sqlite-vec) would replace it at real scale.
 - **Step 8: the monthly projection is an extrapolation,** not a forecast. It's this window's savings per turn × `COST_MODEL_MONTHLY_TURNS` (default 20,000). The 42% savings rate comes from a 6-request demo built to show hits, not from real traffic.
 - **Step 8 touched one Phase 3 test file.** `tests/conftest.py` gained an autouse fixture that points the cache at a per-test temp database and turns it off by default, so existing tests never share or pollute a cache. It's an addition only.
+- **Step 9 touched six Phase 3 files.** `nodes/classify.py`, `nodes/context.py`, `nodes/dispatcher.py` (2 getters), `nodes/agent.py` and `nodes/supervisor.py` each had their hard-coded `ChatAnthropic(model=os.getenv(...))` replaced with `model_router.get_llm("<agent>")`. Every getter keeps its name and signature, and the Phase 3 tests patch them by name and still pass. `tests/conftest.py` gained a second autouse fixture that isolates the router ledger and tier assignments per test.
+- **Step 9: budgets are enforced on the next call, not mid-call.** A tier can overshoot its budget by the cost of the calls already in flight when it crosses the line. Here that's at most one turn's calls, a few cents.
+- **Step 9: the judge isn't routed.** `judge.py` (Step 6) keeps its own `JUDGE_MODEL` because it's an offline evaluator, not a swarm agent, and its spend isn't in the router ledger.
+- **Step 9: newer tier models and structured output.** `claude-opus-5-5` and `claude-sonnet-5-5` reject forced `tool_choice`. `langchain-anthropic` detects their always-on thinking and falls back to `tool_choice: auto` for `with_structured_output`. I verified all five candidate models return valid structured output with both `function_calling` and `json_schema`, so any agent can sit on any tier.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

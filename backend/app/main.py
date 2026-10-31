@@ -16,7 +16,7 @@ load_dotenv()
 from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
-from . import cost_model, job_queue, job_store, semantic_cache  # noqa: E402
+from . import cost_model, job_queue, job_store, model_router, semantic_cache  # noqa: E402
 from .stream_schemas import to_sse  # noqa: E402
 from .streaming import stream_analysis  # noqa: E402
 from .tracing import record_turn_result, setup_tracing, shutdown_tracing, turn_span  # noqa: E402
@@ -229,7 +229,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 8
+PHASE4_LIVE_STEP = 9
 
 
 @app.get("/health")
@@ -267,6 +267,26 @@ def analyze_async(payload: AnalyzeRequest) -> JobAccepted:
         status=job["status"],
         poll_url=f"/jobs/{job['job_id']}",
     )
+
+
+class TierAssignment(BaseModel):
+    tier: Literal["economy", "utility", "standard", "frontier"]
+
+
+@app.get("/router/status")
+def router_status() -> dict:
+    """Phase 4 Step 9: per-agent tier → model, and each tier's spend vs budget."""
+    return model_router.status()
+
+
+@app.put("/router/agents/{agent}")
+def set_router_tier(agent: str, payload: TierAssignment) -> dict:
+    """Reassign one agent's cost tier at runtime — applies to its next LLM call."""
+    try:
+        model_router.set_agent_tier(agent, payload.tier)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return model_router.status()["assignments"][agent]
 
 
 @app.get("/cache/stats")

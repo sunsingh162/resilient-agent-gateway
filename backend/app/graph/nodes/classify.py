@@ -1,23 +1,18 @@
-import os
 from typing import Literal
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from ... import model_router
 from ..state import TicketState
-
-_llm: ChatAnthropic | None = None
 
 
 def get_classify_llm() -> ChatAnthropic:
-    global _llm
-    if _llm is None:
-        # The Anthropic API now rejects an explicit `temperature` for this
-        # model too ("Extra inputs are not permitted") — same treatment as
-        # agent.py. Structured output still constrains it to one category.
-        _llm = ChatAnthropic(model=os.getenv("CLASSIFY_MODEL", "claude-haiku-4-5-20251001"))
-    return _llm
+    # Phase 4 Step 9: model comes from the router ("utility" tier by default).
+    # No explicit temperature — the API now rejects it on this model too;
+    # structured output still constrains it to one category.
+    return model_router.get_llm("classify")
 
 
 class Classification(BaseModel):

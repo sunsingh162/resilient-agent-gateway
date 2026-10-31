@@ -8,21 +8,17 @@ import os
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage
 
+from ... import model_router
 from ..state import TicketState
 
 SUMMARY_TRIGGER_COUNT = int(os.getenv("SUMMARY_TRIGGER_COUNT", "10"))
 KEEP_RECENT_COUNT = int(os.getenv("KEEP_RECENT_COUNT", "4"))
 
-_summarizer_llm: ChatAnthropic | None = None
-
-
 def get_summarizer_llm() -> ChatAnthropic:
-    global _summarizer_llm
-    if _summarizer_llm is None:
-        # Summarization is a cheap compression task — reuse the classify model
-        # rather than the more capable (and pricier) agent model.
-        _summarizer_llm = ChatAnthropic(model=os.getenv("CLASSIFY_MODEL", "claude-haiku-4-5-20251001"))
-    return _summarizer_llm
+    # Summarization is a cheap compression task — "utility" tier by default,
+    # same model as classify. Phase 4 Step 9: the model comes from the router
+    # (per-agent tier + budget), resolved on every call.
+    return model_router.get_llm("summarize")
 
 
 def _render_transcript(messages: list[BaseMessage]) -> str:

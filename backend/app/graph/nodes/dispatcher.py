@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from typing import Literal
 
@@ -8,29 +7,23 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
+from ... import model_router
 from ..state import TicketState
 from ..subgraphs.specialist import build_specialist_subgraph
 from .hitl import extract_pending_write
 
 logger = logging.getLogger("dispatcher")
 
-_dispatcher_llm: ChatAnthropic | None = None
-_synthesizer_llm: ChatAnthropic | None = None
 _specialist_graph = None
 
 
+# Phase 4 Step 9: both models come from the router ("standard" tier by default).
 def get_dispatcher_llm() -> ChatAnthropic:
-    global _dispatcher_llm
-    if _dispatcher_llm is None:
-        _dispatcher_llm = ChatAnthropic(model=os.getenv("AGENT_MODEL", "claude-sonnet-5"))
-    return _dispatcher_llm
+    return model_router.get_llm("dispatcher")
 
 
 def get_synthesizer_llm() -> ChatAnthropic:
-    global _synthesizer_llm
-    if _synthesizer_llm is None:
-        _synthesizer_llm = ChatAnthropic(model=os.getenv("AGENT_MODEL", "claude-sonnet-5"))
-    return _synthesizer_llm
+    return model_router.get_llm("synthesizer")
 
 
 def get_specialist_graph():

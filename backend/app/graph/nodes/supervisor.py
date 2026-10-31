@@ -6,6 +6,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from ... import model_router
 from ..state import TicketState
 from ..subgraphs.specialist import build_specialist_subgraph
 
@@ -21,15 +22,12 @@ WorkerName = Literal[
     "FINISH",
 ]
 
-_supervisor_llm: ChatAnthropic | None = None
 _specialist_graph = None
 
 
 def get_supervisor_llm() -> ChatAnthropic:
-    global _supervisor_llm
-    if _supervisor_llm is None:
-        _supervisor_llm = ChatAnthropic(model=os.getenv("AGENT_MODEL", "claude-sonnet-5"))
-    return _supervisor_llm
+    # Phase 4 Step 9: model comes from the router ("standard" tier by default).
+    return model_router.get_llm("supervisor")
 
 
 def get_specialist_graph():
