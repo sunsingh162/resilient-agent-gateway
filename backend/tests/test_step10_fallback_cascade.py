@@ -114,7 +114,72 @@ def test_the_next_tier_is_told_what_was_already_sent():
 
     prompt = seen[0][-1].content
     assert "PARTIAL ANSWER ALREADY SENT:\nStep 1: forget the network. " in prompt
-    assert "do not repeat" in prompt and "STUDENT QUESTION:\nwifi drops" in prompt
+    assert "Do not repeat" in prompt and "STUDENT QUESTION:\nwifi drops" in prompt
+    assert "Begin directly with the next word" in prompt  # partial ended on whitespace: no anchor to echo
+
+
+def test_a_partial_ending_mid_text_asks_the_next_tier_to_echo_the_final_fragment():
+    seen = []
+    c = cascade(fake(['Go to Wi-Fi settings, select "Campus', "more"], fail_at=1), fake(["…"], log=seen))
+
+    list(c.stream("wifi drops"))
+
+    assert "Begin your output with '\"Campus' written out in full" in seen[0][-1].content
+
+
+# ---- seam trimming (Step 11 drill finding) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "sent, echoed_chunks, expected_seam",
+    [
+        # word boundary: the model echoes "and", trimming restores the space
+        ("2. **Forget and", ["and", " rejoin the network**"], "2. **Forget and rejoin the network**"),
+        ("– Go", ["Go to ", "Settings"], "– Go to Settings"),
+        # mid-word cut: the model completes the word, trimming keeps only the rest
+        ('select "Campus', ['"CampusSecure"', " from the list"], 'select "CampusSecure" from the list'),
+        ("select C", ["CampusSecure, then"], "select CampusSecure, then"),
+        # punctuation-ended partial: echo "enabled." then the new paragraph survives
+        ("Wi-Fi is enabled.", ["enabled.", "\n\n2. Restart"], "Wi-Fi is enabled.\n\n2. Restart"),
+        # the echo arrives split across chunks and with leading whitespace
+        ("Forget and", [" an", "d rejoin"], "Forget and rejoin"),
+    ],
+)
+def test_trim_seam_restores_exact_spacing(sent, echoed_chunks, expected_seam):
+    unverified = []
+
+    out = "".join(fc._trim_seam(iter(echoed_chunks), fc.seam_anchor(sent), lambda: unverified.append(1)))
+
+    assert sent + out == expected_seam
+    assert unverified == []
+
+
+def test_trim_seam_passes_through_and_counts_when_the_model_did_not_echo():
+    unverified = []
+
+    out = "".join(fc._trim_seam(iter(["rejoin the network"]), "and", lambda: unverified.append(1)))
+
+    assert out == "rejoin the network"
+    assert unverified == [1]
+
+
+def test_echoing_model_tier_gets_its_seam_trimmed_end_to_end():
+    secondary = fake(["and", " rejoin the network."])
+    secondary.echoes_seam = True  # what real model tiers set
+    c = cascade(fake(["Forget ", "and", " more"], fail_at=2), secondary)
+
+    transcript = fc.collect(c.stream("wifi drops"))
+
+    assert transcript.text == "Forget and rejoin the network."
+    assert c.health_report()["secondary"]["seams_unverified"] == 0
+
+
+def test_local_kb_tier_continuing_an_answer_starts_a_new_paragraph():
+    c = cascade(fake(["Forget ", "and", " more"], fail_at=2), fake(["y"], fail_at=0), tertiary=fc._local_kb_stream)
+
+    transcript = fc.collect(c.stream("My Wi-Fi keeps dropping in the library"))
+
+    assert transcript.text.startswith("Forget and\n\nOur assistant is temporarily unavailable")
 
 
 def test_first_tier_gets_the_plain_question():

@@ -77,8 +77,59 @@ class Done(_Event):
     status: Literal["completed", "awaiting_approval", "blocked", "error"]
 
 
+# ---- Phase 4, Step 11: /answer/stream (token stream through the fallback cascade)
+
+
+class AnswerDelta(_Event):
+    """A piece of the answer, labelled with the cascade tier (position, not
+    model name) that produced it."""
+
+    type: Literal["answer_delta"] = "answer_delta"
+    text: str
+    tier: str
+    model: str
+
+
+class TierSwitched(_Event):
+    """A tier failed; `to_tier` takes over in this same stream (None: no tier left)."""
+
+    type: Literal["tier_switch"] = "tier_switch"
+    from_tier: str
+    to_tier: Optional[str]
+    reason: str
+    chars_already_sent: int
+
+
+class TierSkippedEvent(_Event):
+    """A tier was skipped without a request because its circuit is open."""
+
+    type: Literal["tier_skipped"] = "tier_skipped"
+    tier: str
+    reason: str
+
+
+class AnswerDone(_Event):
+    type: Literal["answer_done"] = "answer_done"
+    status: Literal["completed", "exhausted"]
+    served_by: list[str]
+    chars_by_tier: dict[str, int]
+    circuits: dict[str, str]
+
+
 StreamEvent = Union[
-    RunStarted, AgentHandoff, ToolCall, ToolResult, SpecialistFinding, ApprovalRequired, FinalAnswer, StreamError, Done
+    RunStarted,
+    AgentHandoff,
+    ToolCall,
+    ToolResult,
+    SpecialistFinding,
+    ApprovalRequired,
+    FinalAnswer,
+    StreamError,
+    Done,
+    AnswerDelta,
+    TierSwitched,
+    TierSkippedEvent,
+    AnswerDone,
 ]
 
 

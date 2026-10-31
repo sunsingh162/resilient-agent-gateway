@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -16,7 +16,9 @@ load_dotenv()
 from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
+from . import answer_stream as answer_stream_module  # noqa: E402
 from . import cost_model, job_queue, job_store, model_router, semantic_cache  # noqa: E402
+from .fallback_cascade import FaultPlan  # noqa: E402
 from .stream_schemas import to_sse  # noqa: E402
 from .streaming import stream_analysis  # noqa: E402
 from .tracing import record_turn_result, setup_tracing, shutdown_tracing, turn_span  # noqa: E402
@@ -229,7 +231,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 9
+PHASE4_LIVE_STEP = 11
 
 
 @app.get("/health")
@@ -267,6 +269,55 @@ def analyze_async(payload: AnalyzeRequest) -> JobAccepted:
         status=job["status"],
         poll_url=f"/jobs/{job['job_id']}",
     )
+
+
+class AnswerRequest(BaseModel):
+    question: str
+
+
+@app.post("/answer/stream")
+def answer_stream(
+    payload: AnswerRequest,
+    x_chaos_cut_primary_after: Optional[int] = Header(default=None, ge=0),
+) -> StreamingResponse:
+    """Phase 4 Step 11: a helpdesk answer streamed token by token through the
+    fallback cascade (Step 10). Each `answer_delta` names the tier that
+    produced it; a mid-stream provider failure becomes a `tier_switch` event
+    and the next tier continues in this same connection.
+
+    X-Chaos-Cut-Primary-After: N cuts the primary tier's real stream after N
+    chunks — honoured only when the gateway runs with CHAOS_ENABLED=true,
+    refused (403) otherwise.
+    """
+    faults = FaultPlan()
+    if x_chaos_cut_primary_after is not None:
+        if not answer_stream_module.chaos_enabled():
+            raise HTTPException(status_code=403, detail="fault injection requires CHAOS_ENABLED=true on the gateway")
+        faults = FaultPlan(after_chunks={"primary": x_chaos_cut_primary_after})
+    request_id = f"answer-{uuid.uuid4()}"
+    events = answer_stream_module.stream_answer(request_id, payload.question, faults, chaos=bool(faults.after_chunks))
+    return StreamingResponse(
+        (to_sse(event) for event in events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Request-Id": request_id},
+    )
+
+
+@app.get("/cascade/health")
+def cascade_health() -> dict:
+    """Per-tier-position attempts, failures, chars served and circuit state."""
+    return answer_stream_module.get_cascade().health_report()
+
+
+@app.post("/cascade/reset")
+def cascade_reset() -> dict:
+    """Fresh breakers and counters, so a drill starts from a known state.
+    Chaos-only, like fault injection: production breakers aren't resettable
+    over HTTP."""
+    if not answer_stream_module.chaos_enabled():
+        raise HTTPException(status_code=403, detail="cascade reset requires CHAOS_ENABLED=true on the gateway")
+    answer_stream_module.reset_cascade()
+    return answer_stream_module.get_cascade().health_report()
 
 
 class TierAssignment(BaseModel):

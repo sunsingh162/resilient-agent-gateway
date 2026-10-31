@@ -24,8 +24,18 @@ def _grade(overall=5.0, safety=5, passed=True, thread_id="t"):
     return {"span_id": "g", "thread_id": thread_id, "overall": overall, "safety": safety, "passed": passed}
 
 
-def _snap(turns=(), grades=(), jobs=()):
-    return monitoring.Snapshot(window_start="2026-10-31T00:00:00+00:00", turns=list(turns), grades=list(grades), jobs=list(jobs))
+def _snap(turns=(), grades=(), jobs=(), cascades=()):
+    return monitoring.Snapshot(
+        window_start="2026-10-31T00:00:00+00:00",
+        turns=list(turns),
+        grades=list(grades),
+        jobs=list(jobs),
+        cascades=list(cascades),
+    )
+
+
+def _cascade(fallback=False, primary_circuit_at_start="closed", exhausted=False):
+    return {"span_id": "c", "fallback": fallback, "primary_circuit_at_start": primary_circuit_at_start, "skipped_open": 0, "exhausted": exhausted, "chaos": False}
 
 
 def _by_name(observations):
@@ -36,7 +46,9 @@ DRILL_SLOS = [dataclasses.replace(slo, min_sample=1) for slo in monitoring.SLOS]
 
 
 def test_healthy_traffic_is_all_ok():
-    snap = _snap(turns=[_turn()] * 5, grades=[_grade()] * 5, jobs=[{"status": "completed"}] * 5)
+    snap = _snap(
+        turns=[_turn()] * 5, grades=[_grade()] * 5, jobs=[{"status": "completed"}] * 5, cascades=[_cascade()] * 5
+    )
 
     assert {o.state for o in monitoring.evaluate(snap)} == {"OK"}
 

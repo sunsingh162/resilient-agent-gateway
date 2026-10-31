@@ -94,6 +94,36 @@ SLOS = [
         min_sample=1,
         severity="page",
     ),
+    # ---- Step 11: cascade health, read from `cascade.answer` spans (/answer/stream)
+    SLO(
+        name="cascade_fallback_rate",
+        description="share of streamed answers that needed a tier other than primary",
+        direction="max",
+        threshold=float(os.getenv("SLO_CASCADE_FALLBACK_RATE", "0.20")),
+        unit="ratio",
+        min_sample=int(os.getenv("SLO_MIN_SAMPLE", "5")),
+        severity="page",
+    ),
+    SLO(
+        # Zero tolerance: an open primary circuit means the main model is down
+        # *right now* and every student is on a fallback tier.
+        name="cascade_primary_circuit_open",
+        description="streamed answers that found the primary tier's circuit open",
+        direction="max",
+        threshold=0,
+        unit="count",
+        min_sample=1,
+        severity="page",
+    ),
+    SLO(
+        name="cascade_exhausted",
+        description="streamed answers where every tier failed",
+        direction="max",
+        threshold=0,
+        unit="count",
+        min_sample=1,
+        severity="page",
+    ),
     SLO(
         name="async_job_failure_rate",
         description="share of async jobs that ended failed",
@@ -116,6 +146,7 @@ class Snapshot:
     turns: list[dict] = field(default_factory=list)
     grades: list[dict] = field(default_factory=list)
     jobs: list[dict] = field(default_factory=list)
+    cascades: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -160,7 +191,24 @@ def collect_snapshot(window_start: str, include_seeded: bool = False) -> Snapsho
         g for g in judge_store.recent_grades(limit=1000, since=window_start) if include_seeded or not g.get("seeded")
     ]
     jobs = job_store.list_jobs(limit=1000, since=window_start)
-    return Snapshot(window_start=window_start, turns=turns, grades=grades, jobs=jobs)
+    cascades = []
+    for span in phoenix_client.get_spans(name="cascade.answer", start_time=window_start):
+        attrs = span.get("attributes") or {}
+        # A drill's deliberately injected faults are synthetic, like seeded
+        # turns — excluded from real-traffic monitoring unless asked for.
+        if attrs.get("cascade.chaos") and not include_seeded:
+            continue
+        cascades.append(
+            {
+                "span_id": span["context"]["span_id"],
+                "fallback": bool(attrs.get("cascade.fallback")),
+                "primary_circuit_at_start": attrs.get("cascade.primary_circuit_at_start"),
+                "skipped_open": attrs.get("cascade.skipped_open", 0),
+                "exhausted": bool(attrs.get("cascade.exhausted")),
+                "chaos": bool(attrs.get("cascade.chaos")),
+            }
+        )
+    return Snapshot(window_start=window_start, turns=turns, grades=grades, jobs=jobs, cascades=cascades)
 
 
 def _measure(slo: SLO, snap: Snapshot) -> tuple[float | None, int, str]:
@@ -179,6 +227,15 @@ def _measure(slo: SLO, snap: Snapshot) -> tuple[float | None, int, str]:
         unsafe = [g for g in snap.grades if g["safety"] <= SAFETY_VIOLATION_MAX_SCORE]
         detail = ", ".join(g.get("thread_id") or g["span_id"] for g in unsafe[:3])
         return (float(len(unsafe)) if snap.grades else None), len(snap.grades), detail
+    if slo.name == "cascade_fallback_rate":
+        fell_back = sum(c["fallback"] for c in snap.cascades)
+        return (fell_back / len(snap.cascades) if snap.cascades else None), len(snap.cascades), f"{fell_back} used a fallback tier"
+    if slo.name == "cascade_primary_circuit_open":
+        found_open = sum(c["primary_circuit_at_start"] == "open" for c in snap.cascades)
+        return (float(found_open) if snap.cascades else None), len(snap.cascades), f"{found_open} hit an open primary circuit"
+    if slo.name == "cascade_exhausted":
+        exhausted = sum(c["exhausted"] for c in snap.cascades)
+        return (float(exhausted) if snap.cascades else None), len(snap.cascades), f"{exhausted} with every tier failed"
     if slo.name == "async_job_failure_rate":
         finished = [j for j in snap.jobs if j["status"] in job_store.TERMINAL_STATUSES]
         failed = sum(j["status"] == "failed" for j in finished)

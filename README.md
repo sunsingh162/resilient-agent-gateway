@@ -53,8 +53,8 @@ Phoenix is optional. If it isn't running, the gateway works normally and tracing
 | 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
 | 8 | Semantic cache | Local-embedding cache in front of `/analyze` and `/analyze/async`. Personal tickets are never cached. A measured per-turn cost model and `GET /cache/stats` (hit rate, $ saved) | ✅ |
 | 9 | Model router | Each of 6 agents → one of 4 cost tiers → a model, chosen on every call. Per-tier USD budgets with automatic downgrade. Every call's tokens and cost go to a ledger. `GET /router/status`, `PUT /router/agents/{agent}` | ✅ |
-| 10 | Fallback cascade | 3 tiers keyed by **position**: Sonnet 5 → Haiku 4.5 → a local KB responder needing no network. A per-tier circuit breaker. Mid-stream hot-swap with per-chunk tier attribution. **Standalone-verified** | ✅ |
-| 11 | Failure drill | Self-contained "cut cable" script + cascade tripwires | ⏳ |
+| 10 | Fallback cascade | 3 tiers keyed by **position**: Sonnet 5 → Haiku 4.5 → a local KB responder needing no network. A per-tier circuit breaker. Mid-stream hot-swap with per-chunk tier attribution. Standalone-verified in this step and live from Step 11 | ✅ |
+| 11 | Failure drill | `POST /answer/stream` (cascade-backed SSE). Chaos-gated fault injection over HTTP. `run_step11_cut_cable.py`. 3 cascade tripwires in the monitor. Fixed the hot-swap seam (exact word joins) | ✅ |
 | 12 | Wiring audit | Live-wired vs standalone honesty table | ⏳ |
 
 ---
@@ -74,6 +74,9 @@ Interactive docs are at `http://localhost:8000/docs`.
 | `POST /analyze` | 2 | Sync. Sends a ticket and blocks until the swarm finishes the turn. `thread_id` is optional: omit it to start a new conversation. |
 | `POST /analyze/stream` | 3 | Same turn as `/analyze`, streamed as Server-Sent Events |
 | `POST /analyze/async` | 4 | Returns `202 Accepted` with a `job_id` immediately and runs the turn on a worker pool |
+| `POST /answer/stream` | 11 | `{"question": …}`. A helpdesk answer streamed token by token through the fallback cascade as SSE: `answer_delta` (text plus the tier that produced it), `tier_switch`, `tier_skipped`, `answer_done` |
+| `GET /cascade/health` | 11 | Per tier position: attempts, failures, chars served, unverified seams, circuit state |
+| `POST /cascade/reset` | 11 | Fresh breakers and counters. **Only with `CHAOS_ENABLED=true`**, `403` otherwise |
 | `GET /router/status` | 9 | Each agent's assigned and effective tier and model, plus each tier's spend, budget and remaining in the rolling window |
 | `PUT /router/agents/{agent}` | 9 | `{"tier": "frontier"}` reassigns one agent at runtime and takes effect on its next LLM call. `404` for an unknown agent, `422` for an unknown tier |
 | `GET /cache/stats` | 8 | Semantic cache hit rate, $ spent, $ saved, savings %, latency saved, and a monthly projection |
@@ -430,6 +433,70 @@ to Settings > Network > Wi-Fi, find CampusSecure, select "Forget," then reconnec
 
 The secondary picked up **mid-sentence**, "Go" → "to Settings > …", with no repeated steps and no restart. The health report records primary 1 attempt, 1 failure, 151 chars, and secondary 1 attempt, 1 success, 854 chars, kept separate per position.
 
+### The cut-cable drill (Step 11)
+
+**Live endpoint.** `POST /answer/stream` streams a helpdesk answer token by token through **one process-wide** `FallbackCascade`. Breaker state therefore carries across requests the way it would in production. Each `answer_delta` names the tier position and model that produced it, a provider failure mid-answer becomes a `tier_switch` event, and the next tier continues **in the same HTTP response**. Every answer is traced as a `cascade.answer` span with `cascade.served_by`, `cascade.fallback`, `cascade.switches`, `cascade.skipped_open`, `cascade.exhausted`, `cascade.primary_circuit_at_start`, `cascade.circuit.<position>` and `cascade.chaos`. Phoenix also shows the cascade's own LLM spans underneath it.
+
+**Fault injection is opt-in twice.** The gateway must run with `CHAOS_ENABLED=true`, **and** the request must carry `X-Chaos-Cut-Primary-After: N`. That cuts the primary's real Anthropic stream after N chunks: the generator is closed, which closes the HTTP response under the SDK. A chaos request to a gateway without the flag gets `403`. It isn't silently ignored, so a drill can't "pass" against a gateway that never injected anything.
+
+**Cascade tripwires in the Step 7 monitor**, read from `cascade.answer` spans. Drill traffic (`cascade.chaos=true`) is excluded from real-traffic monitoring, like seeded turns.
+
+| SLO | Target | Severity |
+|---|---|---|
+| `cascade_fallback_rate` | ≤ 20% of streamed answers needed a non-primary tier | page |
+| `cascade_primary_circuit_open` | 0 answers found the primary circuit open. Zero tolerance: the main model is down *now* | page |
+| `cascade_exhausted` | 0 answers where every tier failed | page |
+
+**Step 11 checklist (the drill passes reliably on repeated runs and shows chunks from two tiers in one response):**
+
+```bash
+# terminal 1 — from backend/, Phoenix already running
+CHAOS_ENABLED=true uvicorn app.main:app --port 8000
+# terminal 2
+cd backend && python scripts/run_step11_cut_cable.py        # --runs 3 --cut-after 12
+```
+
+Recorded run. The full drill ran six times during this step, and all six passed every check:
+
+```
+=== Phase 1 · cut run 1/3  (5.0s, 110 events, 1 connection)
+    1.66s  ── TIER SWITCH primary → secondary after 113 chars (injected fault: primary cut after 12 chunk(s))
+   [primary · claude-sonnet-5] 113 chars: "…1. **Forget and reconnect** – Go to Wi-Fi settings, select"
+   [secondary · claude-haiku-4-5-20251001] 831 chars: 'your network name, tap "Forget," then reconnect by entering your campus credentials again.\n\n2. …'
+   seam: …'connect** – Go to Wi-Fi settings, select' ‖ ' your network name, tap "Forget," then r'…
+=== Phase 1 · cut run 2/3 … seam: …' "forget" the CampusSecure network, then' ‖ ' reconnect by selecting CampusSecure fro'…
+=== Phase 1 · cut run 3/3 … seam: …'elect "Forget this network," then search' ‖ ' for and reconnect to CampusSecure.\n\n2. '…
+=== Phase 2 · circuit open, no fault injected  (4.5s)
+    0.00s  ── TIER SKIPPED primary (circuit open)
+   [secondary · claude-haiku-4-5-20251001] 1195 chars: …
+=== Phase 3 · waiting 31s for the circuit cool-down, then a normal request
+   [primary · claude-sonnet-5] 1608 chars: …
+=== Phase 4 · monitoring tick over the drill window
+  cascade_fallback_rate           0.80  <= 0.2       5  BREACH (page)  4 used a fallback tier
+  cascade_primary_circuit_open       1  <= 0         5  BREACH (page)  1 hit an open primary circuit
+  cascade_exhausted                  0  <= 0         5  OK  0 with every tier failed
+  (latency / error / judge / jobs: no data — no swarm turns in the drill window)
+
+PASS  cut run 1: primary then secondary chunks in one stream, clean answer_done
+PASS  cut run 2: primary then secondary chunks in one stream, clean answer_done
+PASS  cut run 3: primary then secondary chunks in one stream, clean answer_done
+PASS  3 consecutive cuts opened the primary circuit
+PASS  open circuit: primary skipped with zero requests, secondary served the whole answer
+PASS  recovery: half-open trial succeeded, primary served, circuit closed
+PASS  tripwires: paged exactly ['cascade_fallback_rate', 'cascade_primary_circuit_open']
+Step 11 checklist: PASS — the stream survived a mid-response provider cut, every time
+```
+
+**A real defect the drill found, and how it was fixed.** The first drill run passed every check, but reading the seams showed the student was getting broken text at the join:
+
+| Seam (primary ‖ secondary) | What the student read |
+|---|---|
+| `select "Camp` ‖ `usNet,"` | **"CampusNet"**: a network that doesn't exist (it's CampusSecure) |
+| `select C` ‖ `elect the CampusSecure…` | **"select Celect the…"** |
+| `**Forget and` ‖ `rejoin…` (after a first prompt fix) | **"Forget andrejoin"**: the model trims its leading space |
+
+The cut lands on an arbitrary chunk boundary: mid-word (`Campus|Secure`) or between words (`and|rejoin`), and the two look identical from the text alone. So prompting alone couldn't fix it. **Fix:** the continuing tier is told to begin by rewriting the final word fragment of what was sent *in full*, and the cascade **strips that echo in code** (`_trim_seam`) before streaming. That gives exact spacing either way: `and` + `and rejoin…` becomes ` rejoin…`, and `Campus` + `CampusSecure…` becomes `Secure…`. If a model ever doesn't echo, its text passes through unchanged and `seams_unverified` counts it in `/cascade/health`. After the fix, **9 of 9 live seams across 3 drill runs joined exactly**, mid-word cuts included (`cho` ‖ `ose "Forget,"`), with `seams_unverified` at 0. The exact seams from the drill are pinned as tests in `test_step10_fallback_cascade.py`.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -469,6 +536,8 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 9: budgets are enforced on the next call, not mid-call.** A tier can overshoot its budget by the cost of the calls already in flight when it crosses the line. Here that's at most one turn's calls, a few cents.
 - **Step 9: the judge isn't routed.** `judge.py` (Step 6) keeps its own `JUDGE_MODEL` because it's an offline evaluator, not a swarm agent, and its spend isn't in the router ledger.
 - **Step 9: newer tier models and structured output.** `claude-opus-5-5` and `claude-sonnet-5-5` reject forced `tool_choice`. `langchain-anthropic` detects their always-on thinking and falls back to `tool_choice: auto` for `with_structured_output`. I verified all five candidate models return valid structured output with both `function_calling` and `json_schema`, so any agent can sit on any tier.
-- **Step 10: the cascade is standalone-verified, not live-wired.** `fallback_cascade.py` is proven on its own: fake-provider checks plus a real cut of a real Anthropic stream. Nothing in the gateway or the swarm's agent calls goes through it yet. Step 11 puts it behind a live streaming endpoint for the cut-cable drill. Whether it ever wraps the swarm's own agent calls is recorded in the Step 12 wiring table, not assumed here.
+- **Steps 10–11: the cascade protects `/answer/stream`, not the swarm.** Since Step 11 it's live-wired into `POST /answer/stream`, a single-model answer streamed through the cascade, and the drill proves that path live over HTTP. It does **not** wrap the swarm's own agent calls: `/analyze`, `/analyze/stream` and `/analyze/async` call their models through the router (Step 9) with no fallback tier, so a provider outage there still fails the turn, and that shows up as `turn_error_rate`. This is recorded in the Step 12 wiring table.
+- **Step 11: seam quality is mechanical, not semantic.** `_trim_seam` makes the *join* exact, but the continuing tier is a different model and can word things differently. In one recorded run it continued "select" with " your network name" where the primary would likely have written "CampusSecure". The answer stays correct, just less specific.
+- **Step 11: the drill's fault is injected, not a real outage.** `FaultPlan` closes a real in-flight Anthropic stream at a chosen chunk, which is the closest controllable stand-in for a dropped provider connection. Behaviour under an actual Anthropic incident (429s, 529s, slow first token) hasn't been observed.
 - **Step 10: the local KB responder's article order is only as good as `search_kb`.** The Phase 3 tool matches common words like "in" and "the", so a Wi-Fi question can list KB-101 before KB-102. The responder sends the top two matches, so the right article is included, but it isn't ranked first.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

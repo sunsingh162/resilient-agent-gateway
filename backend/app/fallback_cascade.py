@@ -144,6 +144,8 @@ class FaultPlan:
 
 
 def _model_stream(model: str) -> Callable[[list], Iterator[str]]:
+    # Model tiers follow the seam prompt (echo the anchor), so their
+    # continuation output gets _trim_seam applied; see FallbackCascade.stream.
     def stream(messages: list) -> Iterator[str]:
         from langchain_anthropic import ChatAnthropic  # local: the tertiary tier must work with no SDK/key
 
@@ -155,6 +157,7 @@ def _model_stream(model: str) -> Callable[[list], Iterator[str]]:
         except Exception as exc:  # noqa: BLE001 — any provider error is a tier failure
             raise ProviderFailure(f"{model}: {type(exc).__name__}: {exc}") from exc
 
+    stream.echoes_seam = True
     return stream
 
 
@@ -167,14 +170,20 @@ def _local_kb_stream(messages: list) -> Iterator[str]:
     the difference in transport — only in the tier label."""
     from .tools.kb import search_kb
 
-    question = next((m.content for m in messages if isinstance(m, HumanMessage)), "")
-    question = question.split("STUDENT QUESTION:", 1)[-1]
+    prompt = next((m.content for m in messages if isinstance(m, HumanMessage)), "")
+    continuing = "PARTIAL ANSWER ALREADY SENT:" in prompt
+    question = prompt.split("STUDENT QUESTION:", 1)[-1]
     articles = search_kb.invoke({"query": question})
     if articles:
         body = " ".join(f"{a['id']} — {a['title']}: {a['body']}" for a in articles[:2])
         text = f"Our assistant is temporarily unavailable, so here is the matching help article: {body}"
     else:
         text = "Our assistant is temporarily unavailable. Please contact the IT service desk directly and we'll follow up."
+    if continuing:
+        # It can't continue a sentence, so it starts a clearly separate
+        # paragraph. Yielded on its own: the word splitter below skips
+        # leading whitespace.
+        yield "\n\n"
     for word in _WORD.findall(text):
         yield word
 
@@ -211,22 +220,69 @@ class TierSkipped:
     reason: str
 
 
+def seam_anchor(already_sent: str) -> str:
+    """The trailing word fragment of what was sent — '' if it ends in whitespace."""
+    match = re.search(r"\S+$", already_sent)
+    return match.group(0) if match else ""
+
+
 def _messages_for(question: str, already_sent: str) -> list:
     if not already_sent:
         return [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=question)]
+    # The cut lands on an arbitrary chunk boundary: mid-word ("Campus|Secure")
+    # or between words ("and|rejoin"), and the two look identical from the
+    # text. Drill findings: asked to "continue exactly", models invented the
+    # rest of a cut word ("Camp" + "usNet" — a network that doesn't exist)
+    # and dropped the space at word boundaries ("and" + "rejoin"). So the
+    # continuing tier must first re-write the final fragment in full, and
+    # _trim_seam() strips that echo in code — exact spacing either way.
+    anchor = seam_anchor(already_sent)
+    start_rule = (
+        f"Begin your output with {anchor!r} written out in full — completing that word if it was "
+        f"cut off — then continue the answer. (It will be merged with what was already sent.)"
+        if anchor
+        else "Begin directly with the next word of the answer."
+    )
     return [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(
             content=(
                 "Another assistant was answering this student and was cut off mid-answer. "
-                "The student has ALREADY received the partial answer below. Continue it from "
-                "exactly where it stops — do not repeat, restart or summarise anything already "
-                "sent, and do not mention the interruption.\n\n"
+                "The student has ALREADY received the partial answer below.\n\n"
                 f"PARTIAL ANSWER ALREADY SENT:\n{already_sent}\n\n"
+                f"{start_rule} Keep names, network names and numbering consistent with what was "
+                "already sent. Do not repeat, restart or summarise anything else already sent, and "
+                "do not mention the interruption.\n\n"
                 f"STUDENT QUESTION:\n{question}"
             )
         ),
     ]
+
+
+def _trim_seam(stream: Iterator[str], anchor: str, on_unverified: Callable[[], None]) -> Iterator[str]:
+    """Strips the echoed anchor from the start of a continuing tier's output.
+    'and' + 'and rejoin…' → ' rejoin…'; 'Campus' + 'CampusSecure…' → 'Secure…'.
+    If the model didn't echo the anchor, its text passes through untouched
+    and the seam is counted as unverified (visible in the health report)."""
+    if not anchor:
+        yield from stream
+        return
+    buffer = ""
+    for text in stream:
+        buffer += text
+        if len(buffer.lstrip()) > len(anchor):
+            break
+    else:
+        stream = iter(())  # provider finished inside the buffer
+    stripped = buffer.lstrip()
+    if stripped.startswith(anchor):
+        head = stripped[len(anchor):]
+    else:
+        on_unverified()
+        head = buffer
+    if head:
+        yield head
+    yield from stream
 
 
 class FallbackCascade:
@@ -241,7 +297,14 @@ class FallbackCascade:
         self.breakers = breakers or {position: CircuitBreaker(position) for position in TIER_ORDER}
         self._lock = threading.Lock()
         self.health = {
-            position: {"attempts": 0, "failures": 0, "successes": 0, "skipped_open": 0, "chars_served": 0}
+            position: {
+                "attempts": 0,
+                "failures": 0,
+                "successes": 0,
+                "skipped_open": 0,
+                "chars_served": 0,
+                "seams_unverified": 0,
+            }
             for position in TIER_ORDER
         }
 
@@ -268,7 +331,10 @@ class FallbackCascade:
             try:
                 if cut_after == 0:
                     raise ProviderFailure(f"injected fault: {position} failed before its first chunk")
-                stream = self.providers[position](_messages_for(question, sent))
+                provider = self.providers[position]
+                stream = raw = provider(_messages_for(question, sent))
+                if sent and getattr(provider, "echoes_seam", False):
+                    stream = _trim_seam(raw, seam_anchor(sent), lambda p=position: self._count(p, "seams_unverified"))
                 try:
                     for text in stream:
                         if cut_after is not None and served >= cut_after:
@@ -280,9 +346,10 @@ class FallbackCascade:
                 finally:
                     # Closing the generator closes the provider's HTTP stream
                     # underneath it — on an injected fault that's the "cut".
-                    close = getattr(stream, "close", None)
-                    if close:
-                        close()
+                    for gen in (stream, raw) if stream is not raw else (raw,):
+                        close = getattr(gen, "close", None)
+                        if close:
+                            close()
             except ProviderFailure as exc:
                 breaker.record_failure()
                 self._count(position, "failures")
