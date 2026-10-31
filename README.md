@@ -53,7 +53,7 @@ Phoenix is optional. If it isn't running, the gateway works normally and tracing
 | 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
 | 8 | Semantic cache | Local-embedding cache in front of `/analyze` and `/analyze/async`. Personal tickets are never cached. A measured per-turn cost model and `GET /cache/stats` (hit rate, $ saved) | ✅ |
 | 9 | Model router | Each of 6 agents → one of 4 cost tiers → a model, chosen on every call. Per-tier USD budgets with automatic downgrade. Every call's tokens and cost go to a ledger. `GET /router/status`, `PUT /router/agents/{agent}` | ✅ |
-| 10 | Fallback cascade | Tier-keyed cascade + circuit breaker + mid-stream hot-swap | ⏳ |
+| 10 | Fallback cascade | 3 tiers keyed by **position**: Sonnet 5 → Haiku 4.5 → a local KB responder needing no network. A per-tier circuit breaker. Mid-stream hot-swap with per-chunk tier attribution. **Standalone-verified** | ✅ |
 | 11 | Failure drill | Self-contained "cut cable" script + cascade tripwires | ⏳ |
 | 12 | Wiring audit | Live-wired vs standalone honesty table | ⏳ |
 
@@ -381,6 +381,55 @@ Step 9 checklist: PASS — tier swaps change the serving model, confirmed in Pho
 - **Classify on the economy tier costs 11× less** for the same result: `claude-haiku-5-5` at $0.00009 against `claude-haiku-4-5` at $0.00099 per classification, and both returned the same category. Moving `utility` to Haiku 5.5 is the obvious next saving. It's left as an explicit decision rather than a silent default change.
 - **The frontier specialist used fewer calls** (2 against 3–4 on Sonnet 5) but cost more per call. That makes the turn 38% dearer overall ($0.0418 against $0.0303). Cost per completed turn, not per call, is the number to watch.
 
+### Fallback cascade and circuit breaker (Step 10)
+
+`app/fallback_cascade.py` streams an answer from the first healthy tier, in a fixed order:
+
+| Position | Provider | Why this tier |
+|---|---|---|
+| `primary` | `claude-sonnet-5` | The standard model the swarm already uses |
+| `secondary` | `claude-haiku-4-5` | A different model, so one model's outage or overload doesn't take out both |
+| `tertiary` | **local KB responder**: no network, no API key | Answers from the Phase 3 knowledge base, so a student still gets the right help article when every model is unreachable. A third Claude model would fail in exactly the same Anthropic outage |
+
+**Keyed by position, not model name.** Order, breakers, health counters and per-chunk attribution are all keyed by `"primary"`, `"secondary"` and `"tertiary"`. Two positions can deliberately share a model, for example `CASCADE_SECONDARY_MODEL=claude-sonnet-5` for a second region, and still keep separate breakers and counts. A model-keyed dict would merge them, and the report could no longer say *which* tier caught a failure. That's the reference project's documented bug, avoided from the start and covered by a test.
+
+**Circuit breaker, one per position:** CLOSED → OPEN after 3 consecutive failures; OPEN → HALF_OPEN after 30s; HALF_OPEN → CLOSED on one successful trial, or back to OPEN on a failed one, which restarts the cool-down. An open tier is **skipped without sending a request**, so a provider that's genuinely down isn't hammered on every student turn.
+
+**Mid-stream hot-swap.** If a tier fails after part of the answer has streamed, the next tier gets the student's question plus **exactly what was already sent**, and is told to continue from that point without repeating or restarting. Claude 5 models reject assistant prefill, so this is done in the prompt. Continuity is best-effort, but nothing already sent is ever retracted, and the consumer's stream never ends early. Every chunk carries the tier position that produced it. If all three tiers fail, the stream still ends with a terminal `TierSwitch(to_tier=None)` event, not an exception.
+
+**Failure injection.** `FaultPlan(after_chunks={"primary": 12})` aborts a **real** in-flight provider stream after N chunks. Closing the generator closes the underlying HTTP response, and a `ProviderFailure` is raised: from the cascade's side, that's exactly what a dropped provider connection looks like.
+
+**Step 10 checklist (the cascade runs standalone and reports which tier served which part of a response):**
+
+```bash
+cd backend && python -m app.fallback_cascade     # add --offline to skip the live Anthropic part
+```
+
+```
+PASS  circuit breaker: closed→open→half_open→open→closed
+PASS  mid-stream hot-swap: primary chunks then secondary chunks, one stream
+      [primary] 'Forget and rejoin CampusSecure, ' | [secondary] 'disable Wi-Fi power-saving.'
+PASS  open circuit: primary skipped, zero requests sent to it
+PASS  shared model, separate tiers: counts stay per position
+PASS  both models down: tertiary local KB responder answers
+PASS  all tiers down: stream ends with a terminal event, not an exception
+PASS  live: real primary stream cut mid-answer, real secondary continued it
+Step 10 checklist: PASS — cascade reports which tier served which part of the response
+```
+
+The live part used real Anthropic streams for *"My laptop won't connect to the CampusSecure Wi-Fi in the library"*, with the primary cut after 12 chunks (6.4s end to end):
+
+```
+── served by primary (claude-sonnet-5), 151 chars ──
+1. **Check Wi-Fi is on** – Make sure airplane mode is off and Wi-Fi is enabled.
+2. **Forget and reconnect** – Go
+── served by secondary (claude-haiku-4-5-20251001), 854 chars ──
+to Settings > Network > Wi-Fi, find CampusSecure, select "Forget," then reconnect and enter your campus credentials.
+3. **Restart your laptop** – …   (through step 8)
+```
+
+The secondary picked up **mid-sentence**, "Go" → "to Settings > …", with no repeated steps and no restart. The health report records primary 1 attempt, 1 failure, 151 chars, and secondary 1 attempt, 1 success, 854 chars, kept separate per position.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -420,4 +469,6 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 9: budgets are enforced on the next call, not mid-call.** A tier can overshoot its budget by the cost of the calls already in flight when it crosses the line. Here that's at most one turn's calls, a few cents.
 - **Step 9: the judge isn't routed.** `judge.py` (Step 6) keeps its own `JUDGE_MODEL` because it's an offline evaluator, not a swarm agent, and its spend isn't in the router ledger.
 - **Step 9: newer tier models and structured output.** `claude-opus-5-5` and `claude-sonnet-5-5` reject forced `tool_choice`. `langchain-anthropic` detects their always-on thinking and falls back to `tool_choice: auto` for `with_structured_output`. I verified all five candidate models return valid structured output with both `function_calling` and `json_schema`, so any agent can sit on any tier.
+- **Step 10: the cascade is standalone-verified, not live-wired.** `fallback_cascade.py` is proven on its own: fake-provider checks plus a real cut of a real Anthropic stream. Nothing in the gateway or the swarm's agent calls goes through it yet. Step 11 puts it behind a live streaming endpoint for the cut-cable drill. Whether it ever wraps the swarm's own agent calls is recorded in the Step 12 wiring table, not assumed here.
+- **Step 10: the local KB responder's article order is only as good as `search_kb`.** The Phase 3 tool matches common words like "in" and "the", so a Wi-Fi question can list KB-101 before KB-102. The responder sends the top two matches, so the right article is included, but it isn't ranked first.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.
