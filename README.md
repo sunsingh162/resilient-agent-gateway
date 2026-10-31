@@ -35,7 +35,7 @@ python scripts/run_swarm.py       # Step 1: one full swarm run from a plain scri
 | 1 | Confirm the base swarm | Phase 3 swarm imported unchanged + `scripts/run_swarm.py` end-to-end runner | ✅ |
 | 2 | Gateway + sync endpoint | `POST /analyze` (blocks until the swarm finishes or pauses at HITL) + `phase4_live_step` on `/health` | ✅ |
 | 3 | Streaming (SSE) | `POST /analyze/stream`: 9 typed events (`stream_schemas.py`), including tool calls from inside the parallel specialists while they run | ✅ |
-| 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}` | ⏳ |
+| 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}`. Jobs are stored in SQLite, so results survive client disconnects and server restarts | ✅ |
 | 5 | Tracing | OpenTelemetry spans → Arize Phoenix | ⏳ |
 | 6 | LLM-as-judge | Grade traces on 2+ axes | ⏳ |
 | 7 | Monitoring daemon | Named SLOs + paging tripwires | ⏳ |
@@ -61,6 +61,8 @@ Interactive docs are at `http://localhost:8000/docs`.
 |---|---|---|
 | `POST /analyze` | 2 | Sync. Sends a ticket and blocks until the swarm finishes the turn. `thread_id` is optional: omit it to start a new conversation. |
 | `POST /analyze/stream` | 3 | Same turn as `/analyze`, streamed as Server-Sent Events |
+| `POST /analyze/async` | 4 | Returns `202 Accepted` with a `job_id` immediately and runs the turn on a worker pool |
+| `GET /jobs/{job_id}` | 4 | Job status (`queued → running → completed / awaiting_approval / blocked / failed`). Once finished, `result` has the same shape as the `/analyze` response. Unknown IDs return `404` |
 | `GET /health` | 2 | Liveness check, plus `phase4_live_step`: the highest step that is live-wired into request handling |
 | `POST /approvals/{thread_id}/approve` · `/deny` · `/edit-approve` | Phase 3 | Resolve a write paused at the HITL gate |
 | `GET /pending-approvals` · `GET /forensics/{thread_id}` · `POST /tickets/run` · `POST /tickets/stream` | Phase 3 | Unchanged from Phase 3 |
@@ -115,6 +117,27 @@ Recorded run, with arrival time measured on the client:
 
 A low-severity ticket ends with `final_answer` and `done: completed` at about 13s. A prompt-injection attempt ends with `done: blocked` in 8ms, with no LLM call.
 
+### Async jobs (Step 4)
+
+**Step 4 checklist (submit a job, close the client, poll later and still get the result):**
+
+```bash
+# 1. Submit. curl exits as soon as the 202 arrives, so the client is gone.
+curl -s -X POST localhost:8000/analyze/async -H 'Content-Type: application/json' \
+  -d '{"message":"My Wi-Fi keeps dropping every few minutes in the library. Any fix?"}'
+# → HTTP 202 in 4ms: {"job_id":"job-20c5…","status":"queued","poll_url":"/jobs/job-20c5…"}
+
+# 2. Poll from a new client whenever you like.
+curl -s localhost:8000/jobs/<job_id>
+# → "running" at first; ~13s later: "completed" with the full result
+```
+
+Recorded run: 202 returned in **4ms**. An immediate poll showed `running`. The next poll showed `completed`, with `started_at` at 05:24:18 and `finished_at` at 05:24:31, and the full synthesised response in `result`.
+
+**Past the checklist, also verified live:**
+- **Finished jobs survive a server restart.** I stopped uvicorn, started it again, and polled the same `job_id`: still `completed`, with the full result.
+- **A job killed mid-run doesn't hang.** I submitted a job, stopped the server while it was `running`, and restarted it. The startup hook logs `marked 1 job(s) from a previous process as failed`, and polling returns `failed` with the error `server restarted before this job finished — resubmit it`.
+
 ---
 
 ## Base swarm (from Phase 3)
@@ -137,4 +160,6 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 - **Step 3 touched one Phase 3 file.** `dispatcher.py` now passes `metadata={"specialist": category}` into the nested specialist `.invoke()`. Without it, the specialists' tool calls stream out with no link to the parallel branch that made them, so two concurrent specialists can't be told apart. It's metadata only, with no behaviour change, and all 50 Phase 3 tests still pass.
 - **How tool calls get out of the nested graphs:** the specialist ReAct loops run through a plain `.invoke()` inside a node, so LangGraph's `updates` mode only shows them when the whole specialist returns, about 8s later. The live `tool_call` and `tool_result` events come from `messages` mode instead, which LangChain's callback propagation carries out of the nested run.
 - **Approvals stream one at a time.** `hitl_gate` interrupts once per drafted write, so a stream ends at the *first* `approval_required`. The remaining drafts surface on the next resume through `/approvals/{thread_id}/approve`, exactly as in Phase 3.
+- **Step 4's queue is in-process, not a broker.** Jobs run on a `ThreadPoolExecutor` inside the API process. The job *record* is durable (SQLite), but a job that is mid-run when the process dies is lost and gets marked `failed`. It isn't retried. A broker-backed queue (Celery, RQ, Arq) would hand it to another worker instead. That was out of scope here because the swarm, its checkpointer and its approval registry all already live in this one process.
+- **An async job that pauses for approval stays `awaiting_approval`.** Resolving it through `/approvals/{thread_id}/*` finishes the conversation but doesn't update the job record. The job's `result.thread_id` is the handle for continuing it.
 - **Idempotency in action:** on a two-issue ticket, both specialists sometimes draft the same `account` ticket. LangGraph also re-runs `hitl_gate` from the top on each resume. Both cases hit the same `thread_id + category` key, so the ticket store ends up with one ticket per run. A `created: false` in the write outcomes is the de-dupe working as designed.

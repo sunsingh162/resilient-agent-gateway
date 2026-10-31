@@ -1,10 +1,12 @@
 import json
+import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -14,10 +16,22 @@ load_dotenv()
 from .graph import approvals  # noqa: E402
 from .graph.forensics import state_forensics  # noqa: E402
 from .graph.runner import get_compiled_graph, resolve_approval, run_ticket, stream_ticket  # noqa: E402
+from . import job_queue, job_store  # noqa: E402
 from .stream_schemas import to_sse  # noqa: E402
 from .streaming import stream_analysis  # noqa: E402
 
-app = FastAPI(title="Resilient Agent Gateway — Campus IT Helpdesk Swarm")
+logger = logging.getLogger("gateway")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    orphaned = job_store.fail_orphaned_jobs()
+    if orphaned:
+        logger.warning("[gateway] marked %d job(s) from a previous process as failed", orphaned)
+    yield
+
+
+app = FastAPI(title="Resilient Agent Gateway — Campus IT Helpdesk Swarm", lifespan=lifespan)
 
 # Dev-only convenience: the minimal frontend (frontend/index.html) is a
 # static file with no build step, typically opened straight from disk or
@@ -110,6 +124,33 @@ def _to_analyze_response(thread_id: str, result: dict, latency_ms: int) -> Analy
     )
 
 
+class JobAccepted(BaseModel):
+    job_id: str
+    thread_id: str
+    status: str
+    poll_url: str
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    thread_id: str
+    status: Literal["queued", "running", "completed", "awaiting_approval", "blocked", "failed"]
+    created_at: str
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    # Same shape as /analyze's response once the job reaches a terminal
+    # status other than "failed"; null until then.
+    result: Optional[AnalyzeResponse]
+    error: Optional[str]
+
+
+def _analyze_turn(thread_id: str, message: str) -> AnalyzeResponse:
+    start = time.monotonic()
+    result = run_ticket(thread_id, message)
+    latency_ms = int((time.monotonic() - start) * 1000)
+    return _to_analyze_response(thread_id, result, latency_ms)
+
+
 def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
     return TicketResponse(
         thread_id=thread_id,
@@ -123,7 +164,7 @@ def _to_ticket_response(thread_id: str, result: dict) -> TicketResponse:
 # The highest Phase 4 step that is actually live-wired into request handling,
 # bumped only when a step's capability is on the real request path, not
 # merely built and verified standalone.
-PHASE4_LIVE_STEP = 3
+PHASE4_LIVE_STEP = 4
 
 
 @app.get("/health")
@@ -141,10 +182,32 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     for every other request while a 15–20s multi-agent turn runs.
     """
     thread_id = payload.thread_id or f"analyze-{uuid.uuid4()}"
-    start = time.monotonic()
-    result = run_ticket(thread_id, payload.message)
-    latency_ms = int((time.monotonic() - start) * 1000)
-    return _to_analyze_response(thread_id, result, latency_ms)
+    return _analyze_turn(thread_id, payload.message)
+
+
+@app.post("/analyze/async", response_model=JobAccepted, status_code=202)
+def analyze_async(payload: AnalyzeRequest) -> JobAccepted:
+    """Phase 4 Step 4: accept the turn, return a job id immediately (202),
+    run it on the worker pool. The client can disconnect straight away —
+    the result lands in job_store and is recovered via GET /jobs/{job_id}.
+    """
+    thread_id = payload.thread_id or f"job-thread-{uuid.uuid4()}"
+    message = payload.message
+    job, _ = job_queue.submit(thread_id, message, lambda: _analyze_turn(thread_id, message).model_dump())
+    return JobAccepted(
+        job_id=job["job_id"],
+        thread_id=thread_id,
+        status=job["status"],
+        poll_url=f"/jobs/{job['job_id']}",
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatus)
+def get_job(job_id: str) -> JobStatus:
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job_id: {job_id}")
+    return JobStatus(**{key: job[key] for key in JobStatus.model_fields})
 
 
 @app.post("/analyze/stream")
