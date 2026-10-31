@@ -1,65 +1,202 @@
 # Resilient Agent Gateway
 
-**Domain chosen (Problem Statement, Option 1): Productionize your Phase 3 project.** The base swarm is the Campus IT Helpdesk Agent from Phase 3 ([`sunsingh162/campus-it-helpdesk-agent`](https://github.com/sunsingh162/campus-it-helpdesk-agent)). It triages password, network, hardware and account tickets, fans out to parallel specialists, and puts any ticket write behind human approval. Phase 4 adds the production stack on top, one step per commit.
+A campus IT helpdesk multi-agent swarm, made production-ready: streamed, traced, graded, monitored, cost-controlled, and proven to survive a provider failure mid-answer.
 
-**Submission format: Option B, repo only.** Phoenix tracing runs as a local process, and multi-agent turns are too long for serverless timeouts.
-
-> 🚧 **Work in progress.** This README grows with each step. The step table below shows what's done.
+| | |
+|---|---|
+| **Domain (Problem Statement option)** | **Option 1: Productionize your Phase 3 project.** The base is the Campus IT Helpdesk swarm from Phase 3 ([`sunsingh162/campus-it-helpdesk-agent`](https://github.com/sunsingh162/campus-it-helpdesk-agent)): it triages password, network, hardware and account tickets, fans out to parallel specialists, and puts every ticket write behind human approval |
+| **Submission format** | **Option B: GitHub repo only.** Multi-agent turns take 13–22s, too long for serverless timeouts, and the stack keeps local SQLite state |
+| **Local infrastructure** | **No Docker needed.** Arize Phoenix (tracing UI and collector) is a pip-installed Python process. Run it in a second terminal (§III.3). An Anthropic API key is needed for anything that calls a model; without one, the test suite still passes with live tests skipped |
+| **Reviewer setup time** | Clean-machine run (fresh `git clone`, fresh venv, plain `pip install`): **3 min 23 s** to install, then 154 tests pass with live tests skipped. Details in §III.6 |
 
 ---
 
-## Quickstart
+## Part I — What got built, and exactly what's wired
+
+### What got built
+
+Starting from the Phase 3 swarm (LangGraph: triage → parallel specialists → HITL approval gate → synthesizer), Phase 4 added one production concern per step and removed nothing:
+
+- **A FastAPI gateway** with sync (`/analyze`), SSE-streaming (`/analyze/stream`) and async-job (`/analyze/async` → `/jobs/{id}`) endpoints. The stream shows each tool call from *inside* the parallel specialists while they run.
+- **OpenTelemetry tracing into Arize Phoenix:** one trace per request, with a span per graph node, LLM call and tool call.
+- **An LLM-as-judge** that pulls finished traces from Phoenix and grades correctness, safety and tool use. It found a real weakness in the Phase 3 swarm (§IV Step 6).
+- **A monitoring daemon** with 8 named SLOs that pages once on breach and resolves on recovery.
+- **A privacy-scoped semantic cache** with a cost model measured from real token usage, matched to the cent against Phoenix's own token counts.
+- **A dynamic model router:** each agent → a cost tier → a model, with per-tier budgets and automatic downgrade.
+- **A 3-tier fallback cascade** (Sonnet 5 → Haiku 4.5 → a local KB responder needing no network) with circuit breakers and a mid-stream hot-swap, **proven live by a cut-cable drill over HTTP**.
+
+### The honesty table: live-wired vs standalone
+
+"Live-wired" means it runs inside the request path of the running gateway. "Out-of-band" means a separate process or script reading what the live path wrote. "Standalone-verified" means proven on its own and not connected to anything live. Every row was checked against the code (who imports and calls what), not written from memory.
+
+| # | Capability | Status | Exactly where |
+|---|---|---|---|
+| 2 | Sync gateway | **Live-wired** | `POST /analyze` |
+| 3 | SSE streaming of agent events | **Live-wired** | `POST /analyze/stream` |
+| 4 | Async job queue | **Live-wired** | `POST /analyze/async`, `GET /jobs/{id}`. In-process worker pool, SQLite job store |
+| 5 | Tracing → Phoenix | **Live-wired** | Every request with Phoenix running. Root `helpdesk.turn` span on `/analyze`, `/analyze/stream`, `/analyze/async`. `cascade.answer` span on `/answer/stream`. The Phase 3 `/tickets/*` and `/approvals/*` routes are traced by OpenInference but have **no** root `helpdesk.turn` span |
+| 6 | LLM-as-judge | **Out-of-band** (batch) | `scripts/run_step6_judge.py` / `judge.run_judge()`. Reads `helpdesk.turn` traces from Phoenix and writes `judge.db` plus Phoenix annotations. **No request waits on it, and it never grades `/answer/stream` answers** (they aren't `helpdesk.turn` spans) |
+| 7 | Monitoring daemon + paging | **Out-of-band** (separate process) | `python -m app.monitoring`. Reads Phoenix, `judge.db` and `jobs.db`. Paging writes stderr and `alerts.jsonl`, plus an optional webhook. **No real on-call rotation** |
+| 8 | Semantic cache + cost model | **Live-wired on 2 of 3 swarm endpoints** | `/analyze` and `/analyze/async` (shared `_analyze_turn`). **Not** on `/analyze/stream`, `/tickets/*` or `/answer/stream` |
+| 9 | Dynamic model router + budgets | **Live-wired on every swarm LLM call** | All 6 agent call sites, on every endpoint that runs the swarm. **Not** the judge (`JUDGE_MODEL`) and **not** the cascade's models, so `/answer/stream` spend is outside the router's ledger and budgets |
+| 10 | Fallback cascade + circuit breaker | **Live-wired on `/answer/stream` only** | One process-wide cascade behind `POST /answer/stream`. **It does not wrap the swarm.** `/analyze*` and `/tickets/*` have no fallback tier, so a provider outage there fails the turn (and shows up as `turn_error_rate`) |
+| 11 | Fault injection + cascade tripwires | **Live-wired, chaos-gated** | `X-Chaos-Cut-Primary-After` is honoured only when the gateway runs with `CHAOS_ENABLED=true` (`403` otherwise). The 3 cascade SLOs run in the monitoring daemon |
+
+`GET /health` reports `phase4_live_step: 11`: the highest step that is live in some request path. Read it together with the table above: Steps 6 and 7 run out-of-band, and Steps 8–10 are each live on only the endpoints listed.
+
+### Which commands show live cascade behaviour (and which won't)
+
+| Command | Cascade involved? | What you'll see |
+|---|---|---|
+| `POST /answer/stream` with `X-Chaos-Cut-Primary-After: N` on a gateway started with `CHAOS_ENABLED=true` | **Yes** | `answer_delta` from `primary`, then a `tier_switch` to `secondary`, which continues the same answer in the same response. Three in a row open the primary circuit |
+| `POST /answer/stream`, no header, primary circuit closed | Yes, but nothing fails | Every `answer_delta` comes from `primary`, and `answer_done.served_by` is `["primary"]` |
+| `POST /answer/stream`, no header, within 30s of 3 consecutive cuts | **Yes** | `tier_skipped primary (circuit open)`, then the whole answer from `secondary` |
+| `POST /answer/stream` with **no API key** configured | **Yes** | Both model tiers fail auth, and `tertiary` (the local KB responder) answers. Verified on the clean clone |
+| `POST /answer/stream` with the chaos header on a normal gateway | No | `403`. Nothing runs |
+| `POST /analyze`, `/analyze/stream`, `/analyze/async`, `/tickets/*` | **No, never** | The swarm calls its models through the router with no fallback. A provider error fails the turn: `error` event on the stream, `failed` on a job, HTTP 500 on sync |
+
+---
+
+## Part II — How it was built, step by step
+
+Each row is one commit adding one production concern. Nothing a later step relied on was removed.
+
+| # | Step | Adds | Key files | Commit | Why it had to come here |
+|---|---|---|---|---|---|
+| 1 | Base swarm | Phase 3 swarm imported, plus an end-to-end runner | `scripts/run_swarm.py` | `725dd49` | Nothing else matters until the swarm runs end to end from a plain script |
+| 2 | Gateway | `POST /analyze` (sync) | `app/main.py` | `ffe0822` | The swarm has to be a service before it can stream, queue or be observed |
+| 3 | Streaming | `POST /analyze/stream`, 9 typed SSE events | `app/streaming.py`, `app/stream_schemas.py` | `d6bdaad` | A 15–20s blocking call is a bad API. Typed events are also what the cascade later streams through |
+| 4 | Async jobs | `/analyze/async` → 202, `/jobs/{id}`, durable job store | `app/job_store.py`, `app/job_queue.py` | `bd15854` | Long turns must survive a dropped client before anything starts depending on them finishing |
+| 5 | Tracing | OTel → Phoenix, a root span per turn | `app/tracing.py` | `11e7d27` | You can't grade, monitor or cost what you can't see. Steps 6–9 all read these spans |
+| 6 | LLM-as-judge | Grades traces on correctness, safety, tool use | `app/judge.py`, `app/seeded_traces.py` | `a3951d3` | Once traces exist they can be graded automatically. Quality is the signal latency and errors can't see |
+| 7 | Monitoring | Named SLOs, tripwires, paging, incident dedup | `app/monitoring.py` | `03c3883` | Grades and traces only matter if someone is paged when they degrade |
+| 8 | Semantic cache | Privacy-scoped embedding cache, measured cost model | `app/semantic_cache.py`, `app/cost_model.py` | `b750217` | With cost and latency now measured, caching is the first lever. The cost model it introduces is what the router budgets with |
+| 9 | Model router | Agent → tier → model, tier budgets with downgrade, ledger | `app/model_router.py` | `f920e97` | Cost control needs per-agent routing before it can enforce a budget |
+| 10 | Fallback cascade | Position-keyed tiers, circuit breaker, mid-stream hot-swap | `app/fallback_cascade.py` | `cb2803e` | Resilience comes last because only now is there something worth protecting: a priced, routed, monitored service |
+| 11 | Cut-cable drill | `/answer/stream`, chaos-gated injection, cascade tripwires, exact seams | `app/answer_stream.py`, `scripts/run_step11_cut_cable.py` | `e6b6dac` | A resilience claim means nothing until it's proven under a real, deliberate failure, and the monitor must see it happen |
+| 12 | Wiring audit | This README, the honesty table, a clean-machine test, an `.env.example` fix | `README.md`, `.env.example` | *this commit* | The last step makes sure the claims match the code |
+
+---
+
+## Part III — Get it running
+
+### 1. Prerequisites
+
+- **Python 3.11+.** Verified on 3.12.8.
+- **Git.**
+- **An Anthropic API key** from [console.anthropic.com](https://console.anthropic.com), for anything that calls a model. The test suite and the keyless checks in §III.6 run without one.
+- No Docker, no database server. Everything else is a pip package, and all state is local SQLite under `backend/data/` (git-ignored).
+
+### 2. Install
 
 ```bash
 git clone https://github.com/sunsingh162/resilient-agent-gateway.git
 cd resilient-agent-gateway
 
 python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt    # ~3.5 min on a clean venv
 
 cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY=sk-ant-... (no quotes)
-
-cd backend
-python -m pytest tests/ -q        # deterministic tests pass with no key; live ones auto-skip without it
-python scripts/run_swarm.py       # Step 1: one full swarm run from a plain script
+# open .env and paste your key after the =   →   ANTHROPIC_API_KEY=sk-ant-...   (no quotes)
 ```
 
-**Run the full stack** in two terminals from the repo root, with the venv active in each:
+Leave `ANTHROPIC_API_KEY=` empty to run keyless. The live tests then skip themselves.
+
+### 3. Run the stack
+
+Use two terminals from the repo root, with the venv active in each:
 
 ```bash
-# Terminal 1: Phoenix trace UI and collector on :6006 (first start takes ~15s)
+# Terminal 1 — Phoenix trace UI + collector on http://localhost:6006 (first start ~15s)
 PHOENIX_WORKING_DIR=backend/data/phoenix phoenix serve
 
-# Terminal 2: the gateway on :8000
+# Terminal 2 — the gateway on http://localhost:8000 (interactive docs at /docs)
 cd backend && uvicorn app.main:app --port 8000
 ```
 
-Phoenix is optional. If it isn't running, the gateway works normally and tracing just drops its spans.
+Phoenix is optional for the gateway: without it, requests work and spans are dropped. The Step 6, 7, 9 and 11 checklist scripts do need it, because they read traces back.
+
+The first cache-eligible `/analyze` downloads the embedding model once (`BAAI/bge-small-en-v1.5`, about 67MB, into `backend/data/models/`).
+
+### 4. Verify every step's checklist
+
+Run these from `backend/`, with the gateway and Phoenix running where noted:
+
+| Step | Command | Needs |
+|---|---|---|
+| all | `python -m pytest tests/ -q` | nothing (live tests skip without a key) |
+| 1 | `python scripts/run_swarm.py` | key |
+| 2–4 | the `curl` commands in §IV Steps 2–4 | key, gateway |
+| 5 | open http://localhost:6006 → project `resilient-agent-gateway` after any request | key, gateway, Phoenix |
+| 6 | `python scripts/run_step6_judge.py --recent 3` | key, Phoenix |
+| 7 | `python scripts/run_step7_monitor.py` · daemon: `python -m app.monitoring --once` | key, Phoenix |
+| 8 | the `curl` sequence in §IV Step 8, then `curl localhost:8000/cache/stats` | key, gateway |
+| 9 | `python scripts/run_step9_router.py` | key, Phoenix |
+| 10 | `python -m app.fallback_cascade` (add `--offline` for the keyless checks only) | key for the live part |
+| 11 | restart the gateway with `CHAOS_ENABLED=true uvicorn app.main:app --port 8000`, then `python scripts/run_step11_cut_cable.py` | key, chaos gateway, Phoenix |
+
+### 5. Tech stack
+
+| Layer | Choice |
+|---|---|
+| Language | Python 3.12 (3.11+) |
+| Agent framework | LangGraph 1.2 + langchain-core / langchain-anthropic (from Phase 3) |
+| Models | Anthropic Claude through the router's tiers: `claude-haiku-5-5` (economy), `claude-haiku-4-5` (utility: classify, summarize), `claude-sonnet-5` (standard: dispatcher, specialists, synthesizer, judge), `claude-opus-5-5` (frontier, opt-in) |
+| API gateway | FastAPI + Uvicorn, SSE via `StreamingResponse` |
+| Async jobs | In-process `ThreadPoolExecutor` + SQLite job store |
+| Tracing | OpenTelemetry SDK, OpenInference LangChain instrumentor, Arize Phoenix 21 (local) |
+| Evaluation | LLM-as-judge (`claude-sonnet-5`), scores to Phoenix span annotations + SQLite |
+| Monitoring | Custom SLO daemon reading Phoenix REST + SQLite. Paging to stderr, a JSONL log and an optional webhook |
+| Caching | `fastembed` with `BAAI/bge-small-en-v1.5` (local CPU embeddings) + SQLite |
+| Persistence | SQLite throughout: LangGraph checkpoints, tickets, approvals, jobs, judge grades, cache, router ledger |
+| Frontend | Phase 3's plain-HTML approval panel (`frontend/index.html`), unchanged |
+| Tests | pytest: 158 tests (154 deterministic, 4 live) |
+
+### 6. Clean-machine test (recorded for Step 12)
+
+A fresh `git clone` of `main` from GitHub into an empty folder, a fresh venv with plain `pip`, the README's own commands, and **no API key**:
+
+| Check | Result |
+|---|---|
+| `pip install -r requirements.txt` | 3 min 23 s |
+| `pytest tests/ -q` | **154 passed, 4 skipped** |
+| Prompt-injection ticket via `/analyze/stream` | `done: blocked` in 21 ms, with no LLM call |
+| `POST /answer/stream` with no key | primary failed auth → secondary failed auth → **`tertiary` local KB responder answered** (424 chars, `answer_done: completed`) |
+| `X-Chaos-Cut-Primary-After` on a normal gateway | `403` |
+
+**This test found a real bug.** It had existed since Phase 3. `.env.example` shipped `ANTHROPIC_API_KEY=your-anthropic-api-key-here`. After `cp .env.example .env`, that placeholder is a non-empty "key", so the live tests' skip-if-no-key check didn't skip them, and 4 tests failed with `401 invalid x-api-key`, contradicting this README. It never showed up during development because the dev `.env` always held a real key. **Fixed:** the key line now ships empty. The clean clone then gave 154 passed, 4 skipped.
+
+**Secrets check:** all 11 commits were scanned (`git log --all -p`). There are zero `sk-ant-…` key patterns, and no `.env` or `*.db` file has ever been committed. `.env.example` is the only env file tracked.
+
+### 7. Architecture
+
+```
+                          ┌──────────────────────────── FastAPI gateway (app/main.py) ─────────────────────────────┐
+ client ──HTTP/SSE──────► │ /analyze  /analyze/async ──► semantic cache (8) ──hit──► cached answer                 │
+                          │        │                        └─miss/bypass─┐                                          │
+                          │ /analyze/stream ──────────────────────────────┴─► LangGraph swarm (Phase 3)             │
+                          │                                                   triage → dispatch → specialists ×N    │
+                          │                                                   → HITL gate → synthesizer → egress     │
+                          │                                                   every LLM call → model router (9)      │
+                          │                                                     agent → tier → model, budget ledger  │
+                          │ /answer/stream ──► fallback cascade (10/11): primary → secondary → local KB              │
+                          │                     circuit breaker per position, mid-stream hot-swap                    │
+                          │ /jobs/{id} ◄── job store (4)    /cache/stats  /router/*  /cascade/*  /health             │
+                          └──────────────┬─────────────────────────────────────────────────────────────────────────┘
+                                         │ OpenTelemetry spans (5): helpdesk.turn / cascade.answer + node/LLM/tool
+                                         ▼
+                                  Arize Phoenix :6006 ◄──── judge (6, batch): reads traces, writes annotations + judge.db
+                                         ▲
+                                         └──────────────── monitoring daemon (7, separate process): Phoenix + judge.db
+                                                            + jobs.db → 8 SLOs → page / resolve → alerts.jsonl / webhook
+```
 
 ---
 
-## Phase 4 build: one step per commit
+## Part IV — API and evidence, step by step
 
-| # | Step | Adds | Status |
-|---|---|---|---|
-| 1 | Confirm the base swarm | Phase 3 swarm imported unchanged + `scripts/run_swarm.py` end-to-end runner | ✅ |
-| 2 | Gateway + sync endpoint | `POST /analyze` (blocks until the swarm finishes or pauses at HITL) + `phase4_live_step` on `/health` | ✅ |
-| 3 | Streaming (SSE) | `POST /analyze/stream`: 9 typed events (`stream_schemas.py`), including tool calls from inside the parallel specialists while they run | ✅ |
-| 4 | Async job queue | `POST /analyze/async` → 202 + `GET /jobs/{id}`. Jobs are stored in SQLite, so results survive client disconnects and server restarts | ✅ |
-| 5 | Tracing | OpenTelemetry → Arize Phoenix: a root `helpdesk.turn` span per request, plus one span per graph node, LLM call and tool call, including inside the parallel specialists | ✅ |
-| 6 | LLM-as-judge | Pulls finished turns from Phoenix and grades correctness, safety and tool use (1–5). Scores are written back to Phoenix as annotations and to `judge.db` | ✅ |
-| 7 | Monitoring daemon | 5 named SLOs (latency p95, error rate, judge mean, judge safety, async job failures). `tick()` pages on breach and resolves on recovery | ✅ |
-| 8 | Semantic cache | Local-embedding cache in front of `/analyze` and `/analyze/async`. Personal tickets are never cached. A measured per-turn cost model and `GET /cache/stats` (hit rate, $ saved) | ✅ |
-| 9 | Model router | Each of 6 agents → one of 4 cost tiers → a model, chosen on every call. Per-tier USD budgets with automatic downgrade. Every call's tokens and cost go to a ledger. `GET /router/status`, `PUT /router/agents/{agent}` | ✅ |
-| 10 | Fallback cascade | 3 tiers keyed by **position**: Sonnet 5 → Haiku 4.5 → a local KB responder needing no network. A per-tier circuit breaker. Mid-stream hot-swap with per-chunk tier attribution. Standalone-verified in this step and live from Step 11 | ✅ |
-| 11 | Failure drill | `POST /answer/stream` (cascade-backed SSE). Chaos-gated fault injection over HTTP. `run_step11_cut_cable.py`. 3 cascade tripwires in the monitor. Fixed the hot-swap seam (exact word joins) | ✅ |
-| 12 | Wiring audit | Live-wired vs standalone honesty table | ⏳ |
-
----
-
-## Gateway API
+### Gateway API (Steps 2–11)
 
 Start it from `backend/`:
 
@@ -499,7 +636,11 @@ The cut lands on an arbitrary chunk boundary: mid-word (`Campus|Secure`) or betw
 
 ---
 
-## Base swarm (from Phase 3)
+---
+
+## Part V — Base swarm and honesty notes
+
+### Base swarm (from Phase 3)
 
 ```
 START → triage (ingress guardrail → classify → summarize)
@@ -513,7 +654,7 @@ Full Phase 3 architecture, session history and honesty notes: [`docs/phase3-base
 
 ---
 
-## Honesty notes (kept current per step)
+### Honesty notes, by step
 
 - **Step 1:** the Phase 3 code was imported with one fix. The Anthropic API now rejects an explicit `temperature` on `claude-haiku-4-5` (`400: temperature: Extra inputs are not permitted`), so `classify.py` drops it, the same way `agent.py` already did for `claude-sonnet-5`. `run_swarm.py` auto-approves every HITL-paused write so a smoke run can finish, and it prints how many it approved.
 - **Step 3 touched one Phase 3 file.** `dispatcher.py` now passes `metadata={"specialist": category}` into the nested specialist `.invoke()`. Without it, the specialists' tool calls stream out with no link to the parallel branch that made them, so two concurrent specialists can't be told apart. It's metadata only, with no behaviour change, and all 50 Phase 3 tests still pass.
