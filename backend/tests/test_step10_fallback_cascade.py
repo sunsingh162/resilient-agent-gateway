@@ -118,13 +118,31 @@ def test_the_next_tier_is_told_what_was_already_sent():
     assert "Begin directly with the next word" in prompt  # partial ended on whitespace: no anchor to echo
 
 
-def test_a_partial_ending_mid_text_asks_the_next_tier_to_echo_the_final_fragment():
+def test_a_mid_word_cut_never_reaches_the_student():
+    # Demo-page finding: a cut after "select C" made the next model guess the
+    # word from one letter ("C" + "ompusSecure", "CAMPUSNET"). The partial
+    # word is now held back until whitespace, so it's dropped, never sent.
     seen = []
-    c = cascade(fake(['Go to Wi-Fi settings, select "Campus', "more"], fail_at=1), fake(["…"], log=seen))
+    c = cascade(fake(['Go to Wi-Fi settings, select "Camp', 'usSecure" now'], fail_at=1), fake(["CampusSecure"], log=seen))
 
-    list(c.stream("wifi drops"))
+    transcript = fc.collect(c.stream("wifi drops"))
+    [switch] = [e for e in transcript.events if isinstance(e, fc.TierSwitch)]
 
-    assert "Begin your output with '\"Campus' written out in full" in seen[0][-1].content
+    assert transcript.segments[0][2] == "Go to Wi-Fi settings, select "  # '"Camp' never sent
+    assert transcript.text == "Go to Wi-Fi settings, select CampusSecure"
+    assert "unsent partial word '\"Camp' dropped" in switch.reason
+    assert c.health_report()["primary"]["chars_withheld"] == len('"Camp')
+    prompt = seen[0][-1].content
+    assert prompt.rstrip().endswith("STUDENT QUESTION:\nwifi drops")
+    assert "Begin directly with the next word" in prompt  # clean boundary: nothing to echo
+
+
+def test_text_is_released_word_by_word_and_flushed_when_the_tier_finishes():
+    c = cascade(fake(["Forget an", "d rejoin Campus", "Secure"]), fake(["unused"]))
+
+    chunks = [e.text for e in c.stream("q") if isinstance(e, fc.Chunk)]
+
+    assert chunks == ["Forget ", "and rejoin ", "CampusSecure"]
 
 
 # ---- seam trimming (Step 11 drill finding) ----------------------------------
@@ -179,7 +197,9 @@ def test_local_kb_tier_continuing_an_answer_starts_a_new_paragraph():
 
     transcript = fc.collect(c.stream("My Wi-Fi keeps dropping in the library"))
 
-    assert transcript.text.startswith("Forget and\n\nOur assistant is temporarily unavailable")
+    # "and" was mid-flight (no trailing space yet) when the primary failed, so
+    # it was never sent; the local tier starts a new paragraph after "Forget ".
+    assert transcript.text.startswith("Forget \n\nOur assistant is temporarily unavailable")
 
 
 def test_first_tier_gets_the_plain_question():
@@ -218,14 +238,14 @@ def test_repeated_failures_trip_the_breaker_so_later_requests_skip_primary():
 
 
 def test_tiers_sharing_a_model_keep_separate_health_and_breakers():
-    c = cascade(fake(["a", "b"], fail_at=1), fake(["c"]), models={"primary": "same", "secondary": "same", "tertiary": "local"})
+    c = cascade(fake(["a ", "b "], fail_at=1), fake(["c"]), models={"primary": "same", "secondary": "same", "tertiary": "local"})
 
     transcript = fc.collect(c.stream("q"))
     health = c.health_report()
 
     assert transcript.served_by == ["primary", "secondary"]
     assert (health["primary"]["failures"], health["secondary"]["failures"]) == (1, 0)
-    assert (health["primary"]["chars_served"], health["secondary"]["chars_served"]) == (1, 1)
+    assert (health["primary"]["chars_served"], health["secondary"]["chars_served"]) == (2, 1)
     assert c.breakers["primary"] is not c.breakers["secondary"]
 
 
@@ -251,13 +271,13 @@ def test_every_tier_down_ends_the_stream_with_a_terminal_switch():
     ]
 
 
-@pytest.mark.parametrize("after, primary_chars", [(0, 0), (2, 2)])
+@pytest.mark.parametrize("after, primary_chars", [(0, 0), (2, 4)])
 def test_fault_plan_cuts_a_tier_and_closes_its_stream(after, primary_chars):
     closed = []
 
     def closable(messages):
         try:
-            yield from ["a", "b", "c", "d"]
+            yield from ["a ", "b ", "c ", "d "]
         finally:
             closed.append(True)
 

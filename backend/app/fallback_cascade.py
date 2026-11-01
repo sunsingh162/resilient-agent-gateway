@@ -303,6 +303,7 @@ class FallbackCascade:
                 "successes": 0,
                 "skipped_open": 0,
                 "chars_served": 0,
+                "chars_withheld": 0,
                 "seams_unverified": 0,
             }
             for position in TIER_ORDER
@@ -328,6 +329,15 @@ class FallbackCascade:
             self._count(position, "attempts")
             cut_after = faults.after_chunks.get(position)
             served = 0
+            # Word-boundary hold-back: text after the last whitespace is held
+            # until the next whitespace arrives (or the tier finishes), so the
+            # consumer only ever receives complete words. A tier that dies
+            # mid-word takes its unsent fragment with it, and the next tier
+            # starts on a clean boundary. Without this, a cut after "select C"
+            # left the next model guessing the word from one letter — the
+            # browser check caught "C" + "ompusSecure" and live Haiku runs gave
+            # "CAMPUSNET". Cost: each chunk is delayed by at most one word.
+            held = ""
             try:
                 if cut_after == 0:
                     raise ProviderFailure(f"injected fault: {position} failed before its first chunk")
@@ -340,9 +350,18 @@ class FallbackCascade:
                         if cut_after is not None and served >= cut_after:
                             raise ProviderFailure(f"injected fault: {position} cut after {served} chunk(s)")
                         served += 1
-                        sent += text
-                        self._count(position, "chars_served", len(text))
-                        yield Chunk(text=text, tier=position, model=self.models[position])
+                        held += text
+                        boundary = max(held.rfind(" "), held.rfind("\n"), held.rfind("\t"))
+                        if boundary >= 0:
+                            ready, held = held[: boundary + 1], held[boundary + 1 :]
+                            sent += ready
+                            self._count(position, "chars_served", len(ready))
+                            yield Chunk(text=ready, tier=position, model=self.models[position])
+                    if held:  # the tier finished: its last word is complete
+                        sent += held
+                        self._count(position, "chars_served", len(held))
+                        yield Chunk(text=held, tier=position, model=self.models[position])
+                        held = ""
                 finally:
                     # Closing the generator closes the provider's HTTP stream
                     # underneath it — on an injected fault that's the "cut".
@@ -353,8 +372,10 @@ class FallbackCascade:
             except ProviderFailure as exc:
                 breaker.record_failure()
                 self._count(position, "failures")
+                self._count(position, "chars_withheld", len(held))
                 next_position = TIER_ORDER[index + 1] if index + 1 < len(TIER_ORDER) else None
-                yield TierSwitch(from_tier=position, to_tier=next_position, reason=str(exc), chars_already_sent=len(sent))
+                reason = f"{exc}" + (f"; unsent partial word {held!r} dropped" if held else "")
+                yield TierSwitch(from_tier=position, to_tier=next_position, reason=reason, chars_already_sent=len(sent))
                 continue
 
             breaker.record_success()

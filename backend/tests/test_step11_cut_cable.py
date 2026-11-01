@@ -100,7 +100,13 @@ def test_cut_primary_hands_over_to_secondary_in_the_same_response(cascade, chaos
     types = [e["type"] for e in events]
     assert types[0] == "run_started" and types[-1] == "answer_done"
     deltas = [(e["tier"], e["text"]) for e in events if e["type"] == "answer_delta"]
-    assert deltas == [("primary", "Forget "), ("primary", "and "), ("secondary", "rejoin CampusSecure, then restart.")]
+    # Released at word boundaries: the last word is flushed when the tier finishes.
+    assert deltas == [
+        ("primary", "Forget "),
+        ("primary", "and "),
+        ("secondary", "rejoin CampusSecure, then "),
+        ("secondary", "restart."),
+    ]
     [switch] = [e for e in events if e["type"] == "tier_switch"]
     assert (switch["from_tier"], switch["to_tier"], switch["chars_already_sent"]) == ("primary", "secondary", len("Forget and "))
     assert events[-1] == {
@@ -189,3 +195,15 @@ def test_chaos_runs_are_excluded_from_real_traffic_monitoring(monkeypatch):
 
     assert [c["span_id"] for c in monitoring.collect_snapshot("x").cascades] == ["real"]
     assert [c["span_id"] for c in monitoring.collect_snapshot("x", include_seeded=True).cascades] == ["real", "drill"]
+
+
+# ---- reviewer demo page -----------------------------------------------------
+
+
+def test_demo_page_is_served_and_wired_to_the_real_endpoints():
+    resp = client.get("/demo")
+
+    assert resp.status_code == 200 and resp.headers["content-type"].startswith("text/html")
+    page = resp.text
+    for endpoint in ("/answer/stream", "/analyze/stream", '"/analyze"', "/cache/stats", "/cascade/reset", "X-Chaos-Cut-Primary-After"):
+        assert endpoint in page

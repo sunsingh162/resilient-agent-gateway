@@ -11,6 +11,28 @@ A campus IT helpdesk multi-agent swarm, made production-ready: streamed, traced,
 
 ---
 
+## Reviewer walkthrough (about 10 minutes)
+
+**Set up** with install as in §III.2 (about 3.5 min), then run two terminals from the repo root with the venv active:
+
+```bash
+PHOENIX_WORKING_DIR=backend/data/phoenix phoenix serve                     # terminal 1 → http://localhost:6006
+cd backend && CHAOS_ENABLED=true uvicorn app.main:app --port 8000          # terminal 2 → http://localhost:8000/demo
+```
+
+Then open **http://localhost:8000/demo**. Each grading question in the Problem Statement maps to one click or one command:
+
+| Problem Statement asks… | Do this | You should see |
+|---|---|---|
+| **Does the streaming endpoint survive a mid-response provider failure without dropping the connection, demonstrated live?** | `/demo` panel 1 → **✂ Stream + cut primary after 12 chunks**. Click it 3 times, then **Stream answer** | The answer starts in blue (`primary · claude-sonnet-5`), a red **⚡ primary → secondary** marker appears mid-sentence, and it carries on in amber (`secondary · claude-haiku-4-5`) **in the same response**, with *"✓ Connection survived the cut"*. After the 3rd cut the `primary` badge turns **open**. The next normal request logs `tier_skipped primary (circuit open) — no request sent to it`. Automated version: `python scripts/run_step11_cut_cable.py` → 7/7 PASS |
+| **Do Phoenix traces show real spans from a real run, not an empty project?** | After any click on `/demo`, open **http://localhost:6006** → project **`resilient-agent-gateway`** → the newest trace | Panel 3 traces show `POST /analyze/stream` → `helpdesk.turn` → `LangGraph` → one subtree per `parallel_specialist_worker` → `agent` → `tools` → `search_kb` / `assess_severity` / `create_ticket`, with LLM spans carrying model name and token counts. Panel 1 traces show `cascade.answer` with `cascade.served_by` and `cascade.circuit.*` |
+| **Does re-sending an identical query provably hit the semantic cache?** | `/demo` panel 2 → **Ask** twice, then reword the question and Ask again | Row 1: `miss`, about 15–25s, a few cents. Row 2: **`hit`, similarity 1.000, about 0.02s, $0**. The reworded row is a hit at about 0.95. The `/cache/stats` line under the table increments live. Adding `my ID is S1002` gives **`bypass`**: personal tickets are never cached |
+| **Can the monitoring daemon catch a synthetic degradation and fire the correct tripwire?** | `cd backend && python scripts/run_step7_monitor.py`, then the cascade tripwires in `run_step11_cut_cable.py` phase 4 | Four injected degradations each page **exactly** their own SLO (answer quality → `judge_safety_violations` + `judge_score_mean`, error → `turn_error_rate`, 45s turn → `turn_latency_p95`). The cut-cable drill pages exactly `cascade_fallback_rate` + `cascade_primary_circuit_open` |
+
+**Before relying on any of it,** read the honesty table just below. It says precisely which of these capabilities run inside the request path and which don't. For example, the fallback cascade protects `/answer/stream` only, not `/analyze`.
+
+---
+
 ## Part I — What got built, and exactly what's wired
 
 ### What got built
@@ -24,6 +46,7 @@ Starting from the Phase 3 swarm (LangGraph: triage → parallel specialists → 
 - **A privacy-scoped semantic cache** with a cost model measured from real token usage, matched to the cent against Phoenix's own token counts.
 - **A dynamic model router:** each agent → a cost tier → a model, with per-tier budgets and automatic downgrade.
 - **A 3-tier fallback cascade** (Sonnet 5 → Haiku 4.5 → a local KB responder needing no network) with circuit breakers and a mid-stream hot-swap, **proven live by a cut-cable drill over HTTP**.
+- **A reviewer demo page at `/demo`:** cut the cable, watch the cache, or watch the agents work, each with one click in the browser.
 
 ### The honesty table: live-wired vs standalone
 
@@ -74,7 +97,8 @@ Each row is one commit adding one production concern. Nothing a later step relie
 | 9 | Model router | Agent → tier → model, tier budgets with downgrade, ledger | `app/model_router.py` | `f920e97` | Cost control needs per-agent routing before it can enforce a budget |
 | 10 | Fallback cascade | Position-keyed tiers, circuit breaker, mid-stream hot-swap | `app/fallback_cascade.py` | `cb2803e` | Resilience comes last because only now is there something worth protecting: a priced, routed, monitored service |
 | 11 | Cut-cable drill | `/answer/stream`, chaos-gated injection, cascade tripwires, exact seams | `app/answer_stream.py`, `scripts/run_step11_cut_cable.py` | `e6b6dac` | A resilience claim means nothing until it's proven under a real, deliberate failure, and the monitor must see it happen |
-| 12 | Wiring audit | This README, the honesty table, a clean-machine test, an `.env.example` fix | `README.md`, `.env.example` | *this commit* | The last step makes sure the claims match the code |
+| 12 | Wiring audit | This README, the honesty table, a clean-machine test, an `.env.example` fix | `README.md`, `.env.example` | `b74fcc2` | The last step makes sure the claims match the code |
+| 12+ | Reviewer demo | `GET /demo` reviewer page. Word-boundary hold-back in the cascade, a seam bug the browser check found | `app/static/demo.html`, `app/fallback_cascade.py` | *this commit* | A reviewer should be able to *see* the hot-swap and the cache in one click, and clicking through it in a real browser exposed a seam case no earlier test covered |
 
 ---
 
@@ -126,6 +150,7 @@ Run these from `backend/`, with the gateway and Phoenix running where noted:
 | Step | Command | Needs |
 |---|---|---|
 | all | `python -m pytest tests/ -q` | nothing (live tests skip without a key) |
+| 2, 3, 8, 10, 11 | **open http://localhost:8000/demo** and use the three panels (§ Reviewer walkthrough) | key, gateway started with `CHAOS_ENABLED=true` |
 | 1 | `python scripts/run_swarm.py` | key |
 | 2–4 | the `curl` commands in §IV Steps 2–4 | key, gateway |
 | 5 | open http://localhost:6006 → project `resilient-agent-gateway` after any request | key, gateway, Phoenix |
@@ -151,7 +176,7 @@ Run these from `backend/`, with the gateway and Phoenix running where noted:
 | Caching | `fastembed` with `BAAI/bge-small-en-v1.5` (local CPU embeddings) + SQLite |
 | Persistence | SQLite throughout: LangGraph checkpoints, tickets, approvals, jobs, judge grades, cache, router ledger |
 | Frontend | Phase 3's plain-HTML approval panel (`frontend/index.html`), unchanged |
-| Tests | pytest: 158 tests (154 deterministic, 4 live) |
+| Tests | pytest: 160 tests (156 deterministic, 4 live), plus a headless-Chromium check of `/demo` during Step 12 |
 
 ### 6. Clean-machine test (recorded for Step 12)
 
@@ -160,7 +185,7 @@ A fresh `git clone` of `main` from GitHub into an empty folder, a fresh venv wit
 | Check | Result |
 |---|---|
 | `pip install -r requirements.txt` | 3 min 23 s |
-| `pytest tests/ -q` | **154 passed, 4 skipped** |
+| `pytest tests/ -q` | **154 passed, 4 skipped** (the suite at that point; the later `/demo` and hold-back tests bring it to 156 + 4) |
 | Prompt-injection ticket via `/analyze/stream` | `done: blocked` in 21 ms, with no LLM call |
 | `POST /answer/stream` with no key | primary failed auth → secondary failed auth → **`tertiary` local KB responder answered** (424 chars, `answer_done: completed`) |
 | `X-Chaos-Cut-Primary-After` on a normal gateway | `403` |
@@ -218,6 +243,7 @@ Interactive docs are at `http://localhost:8000/docs`.
 | `PUT /router/agents/{agent}` | 9 | `{"tier": "frontier"}` reassigns one agent at runtime and takes effect on its next LLM call. `404` for an unknown agent, `422` for an unknown tier |
 | `GET /cache/stats` | 8 | Semantic cache hit rate, $ spent, $ saved, savings %, latency saved, and a monthly projection |
 | `GET /jobs/{job_id}` | 4 | Job status (`queued → running → completed / awaiting_approval / blocked / failed`). Once finished, `result` has the same shape as the `/analyze` response. Unknown IDs return `404` |
+| `GET /demo` | 12 | **Reviewer demo page.** Cut-the-cable (answer shaded by tier, ⚡ at the handover, live circuit badges), semantic cache (ask twice, compare latency and cost), and a live agent event stream. It calls the endpoints above from the browser, so nothing is mocked |
 | `GET /health` | 2 | Liveness check, plus `phase4_live_step`: the highest step that is live-wired into request handling |
 | `POST /approvals/{thread_id}/approve` · `/deny` · `/edit-approve` | Phase 3 | Resolve a write paused at the HITL gate |
 | `GET /pending-approvals` · `GET /forensics/{thread_id}` · `POST /tickets/run` · `POST /tickets/stream` | Phase 3 | Unchanged from Phase 3 |
@@ -632,9 +658,12 @@ Step 11 checklist: PASS — the stream survived a mid-response provider cut, eve
 | `select C` ‖ `elect the CampusSecure…` | **"select Celect the…"** |
 | `**Forget and` ‖ `rejoin…` (after a first prompt fix) | **"Forget andrejoin"**: the model trims its leading space |
 
-The cut lands on an arbitrary chunk boundary: mid-word (`Campus|Secure`) or between words (`and|rejoin`), and the two look identical from the text alone. So prompting alone couldn't fix it. **Fix:** the continuing tier is told to begin by rewriting the final word fragment of what was sent *in full*, and the cascade **strips that echo in code** (`_trim_seam`) before streaming. That gives exact spacing either way: `and` + `and rejoin…` becomes ` rejoin…`, and `Campus` + `CampusSecure…` becomes `Secure…`. If a model ever doesn't echo, its text passes through unchanged and `seams_unverified` counts it in `/cascade/health`. After the fix, **9 of 9 live seams across 3 drill runs joined exactly**, mid-word cuts included (`cho` ‖ `ose "Forget,"`), with `seams_unverified` at 0. The exact seams from the drill are pinned as tests in `test_step10_fallback_cascade.py`.
+The cut lands on an arbitrary chunk boundary: mid-word (`Campus|Secure`) or between words (`and|rejoin`), and the two look identical from the text alone. The fix took two rounds.
 
----
+1. **Echo and trim (Step 11).** The continuing tier is told to begin by rewriting the final word fragment of what was sent *in full*, and the cascade strips that echo in code (`_trim_seam`): `and` + `and rejoin…` becomes ` rejoin…`. The next 9 live seams joined exactly.
+2. **Word-boundary hold-back (Step 12).** The `/demo` browser check then caught a case echo-and-trim can't handle: a cut right after **`select C`** produced **"C" ‖ "ompusSecure"**. Reproducing it against live Haiku gave `C**ampus`, `CAMPUSNET` and `Campus – select C` on four tries. One letter doesn't tell the next model which word was meant. **Fix:** the cascade now holds back each tier's text after the last whitespace until the next whitespace arrives, so the student **only ever receives complete words**. A tier that dies mid-word takes its unsent fragment with it: it's dropped, counted in `chars_withheld`, and named in the `tier_switch` reason. The next tier always starts on a clean word boundary. The cost is a delay of at most one word per chunk.
+
+**Result after the hold-back:** 6 of 6 cuts in the browser (cut points 7–15 chunks) and 3 of 3 in the CLI drill landed on a word boundary, with natural continuations: *"Toggle Wi-Fi off and ⚡ on again to refresh the connection."* Echo-and-trim stays as a backstop, and `seams_unverified` stays at 0. The exact failing seams are pinned as tests in `test_step10_fallback_cascade.py`.
 
 ---
 

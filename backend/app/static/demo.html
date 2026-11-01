@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gateway Demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5b6573; --line: #dde1e6;
+    --accent: #2457d6; --primary: #dbe7ff; --primary-ink: #1d3f99; --secondary: #ffe9c7; --secondary-ink: #8a4b00;
+    --tertiary: #d8f3e1; --tertiary-ink: #1d6b3a; --bad: #b42318; --good: #157f3d; --warn: #9a6700;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #9aa4b2; --line: #2a3039;
+      --accent: #7aa2ff; --primary: #1d2c52; --primary-ink: #b9ccff; --secondary: #4a3415; --secondary-ink: #ffd59a;
+      --tertiary: #173a26; --tertiary-ink: #a6e7bd; --bad: #ff8a80; --good: #6fdc95; --warn: #ffcc66;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { padding: 20px 16px 8px; max-width: 1100px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); }
+  nav { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 14px; }
+  a { color: var(--accent); }
+  main { max-width: 1100px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  h2 { margin: 0 0 4px; font-size: 17px; }
+  .hint { color: var(--muted); font-size: 13.5px; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input[type=text] { flex: 1 1 320px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+  input[type=number] { width: 64px; padding: 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+  button { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; cursor: pointer; }
+  button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.cut { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .answer { min-height: 120px; white-space: pre-wrap; border: 1px dashed var(--line); border-radius: 8px; padding: 12px; line-height: 1.6; }
+  .t-primary { background: var(--primary); color: var(--primary-ink); }
+  .t-secondary { background: var(--secondary); color: var(--secondary-ink); }
+  .t-tertiary { background: var(--tertiary); color: var(--tertiary-ink); }
+  .switch { display: inline-block; margin: 0 2px; padding: 0 6px; border-radius: 4px; background: var(--bad); color: #fff; font-size: 12px; font-weight: 600; }
+  .legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; margin: 8px 0; }
+  .legend span { padding: 1px 8px; border-radius: 4px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+  .badge { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-family: var(--mono); }
+  .badge.open { border-color: var(--bad); color: var(--bad); }
+  .badge.half_open { border-color: var(--warn); color: var(--warn); }
+  .badge.closed { border-color: var(--good); color: var(--good); }
+  .verdict { margin-top: 10px; font-weight: 600; }
+  .verdict.ok { color: var(--good); } .verdict.bad { color: var(--bad); }
+  .log { font-family: var(--mono); font-size: 12.5px; max-height: 220px; overflow: auto; background: var(--bg); border-radius: 6px; padding: 8px; margin-top: 10px; }
+  .log div { white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  .scroll { overflow-x: auto; }
+  .hit { color: var(--good); font-weight: 600; } .miss, .bypass { color: var(--warn); font-weight: 600; }
+  .stats { font-family: var(--mono); font-size: 13px; margin-top: 10px; color: var(--muted); }
+  .err { color: var(--bad); margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Resilient Agent Gateway — live demo</h1>
+  <p>Campus IT helpdesk swarm, Phase 4. Everything on this page calls the real gateway on this machine; nothing is mocked.</p>
+  <nav>
+    <a href="http://localhost:6006" target="_blank" rel="noopener">Phoenix traces ↗</a>
+    <a href="/docs" target="_blank">API docs (/docs) ↗</a>
+    <a href="/health" target="_blank">/health</a>
+    <a href="/cascade/health" target="_blank">/cascade/health</a>
+    <a href="/router/status" target="_blank">/router/status</a>
+    <a href="/cache/stats" target="_blank">/cache/stats</a>
+  </nav>
+</header>
+
+<main>
+  <!-- 1. Cut the cable -->
+  <section id="cascade">
+    <h2>1 · Cut the cable — mid-answer provider failure</h2>
+    <p class="hint">Streams an answer through the fallback cascade (<code>POST /answer/stream</code>). Text is shaded by the tier that wrote it.
+      <b>✂ Cut</b> kills the primary model's real stream after N chunks — the next tier continues in the <i>same</i> HTTP connection.
+      Cut three times in a row and the primary's circuit opens; the next normal request skips it. Requires the gateway to run with <code>CHAOS_ENABLED=true</code>.</p>
+    <div class="row">
+      <input type="text" id="c-q" value="My laptop won't connect to the CampusSecure Wi-Fi in the library. What should I try?">
+    </div>
+    <div class="row">
+      <button class="go" id="c-normal">Stream answer</button>
+      <button class="cut" id="c-cut">✂ Stream + cut primary after</button>
+      <input type="number" id="c-n" value="12" min="0" max="200"> chunks
+      <button id="c-reset">Reset breakers</button>
+    </div>
+    <div class="legend">
+      <span class="t-primary">primary · claude-sonnet-5</span>
+      <span class="t-secondary">secondary · claude-haiku-4-5</span>
+      <span class="t-tertiary">tertiary · local KB responder</span>
+      <span class="switch">⚡ tier switch</span>
+    </div>
+    <div class="answer" id="c-answer" aria-live="polite"></div>
+    <div class="verdict" id="c-verdict"></div>
+    <div class="badges" id="c-circuits" style="margin-top:8px"></div>
+    <div class="err" id="c-err"></div>
+    <div class="log" id="c-log"></div>
+  </section>
+
+  <!-- 2. Semantic cache -->
+  <section id="cache">
+    <h2>2 · Semantic cache — same question, near-instant second time</h2>
+    <p class="hint">Sends the ticket through the full swarm (<code>POST /analyze</code>). Ask, then ask again (or reword it): the second time is served from the cache.
+      Tickets naming a student ID or containing an email/phone are <i>never</i> cached (privacy) — try "my ID is S1002" to see a bypass.</p>
+    <div class="row">
+      <input type="text" id="k-q" value="The lab printer in building C keeps printing blank pages. How do I fix it?">
+      <button class="go" id="k-ask">Ask</button>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>#</th><th>Question</th><th>Cache</th><th>Similarity</th><th>Latency</th><th>Cost</th><th>Status</th></tr></thead>
+        <tbody id="k-rows"></tbody>
+      </table>
+    </div>
+    <div class="answer" id="k-answer" style="min-height:60px;margin-top:10px"></div>
+    <div class="stats" id="k-stats"></div>
+    <div class="err" id="k-err"></div>
+  </section>
+
+  <!-- 3. Live agent stream -->
+  <section id="agents">
+    <h2>3 · Live agent stream — the swarm working, event by event</h2>
+    <p class="hint">Streams one swarm turn as typed Server-Sent Events (<code>POST /analyze/stream</code>): handoffs, each specialist's tool calls while it runs, approval pauses, the final answer.
+      Times are measured in this browser as events arrive. Afterwards, open Phoenix to see the same turn as a trace tree.</p>
+    <div class="row">
+      <input type="text" id="a-q" value="My Wi-Fi keeps dropping in the library, and is my student account S1002 locked?">
+      <button class="go" id="a-go">Run</button>
+    </div>
+    <div class="log" id="a-log" style="max-height:320px"></div>
+    <div class="answer" id="a-answer" style="min-height:40px;margin-top:10px"></div>
+    <div class="err" id="a-err"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// POST + Server-Sent Events: EventSource only does GET, so read the body stream
+// and split on the blank line that ends each SSE event.
+async function postSSE(url, body, headers, onEvent) {
+  const resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}: ${await resp.text()}`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      const data = block.split("\n").find((line) => line.startsWith("data: "));
+      if (data) onEvent(JSON.parse(data.slice(6)));
+    }
+  }
+}
+
+function busy(ids, on) { ids.forEach((id) => ($(id).disabled = on)); }
+function log(el, text) { const d = document.createElement("div"); d.textContent = text; el.appendChild(d); el.scrollTop = el.scrollHeight; }
+
+// ---- 1. cascade ----------------------------------------------------------
+function renderCircuits(circuits) {
+  $("c-circuits").innerHTML = Object.entries(circuits)
+    .map(([tier, state]) => `<span class="badge ${state}">${tier}: ${state.replace("_", "-")}</span>`).join("");
+}
+async function refreshCircuits() {
+  try {
+    const h = await (await fetch("/cascade/health")).json();
+    renderCircuits(Object.fromEntries(Object.entries(h).map(([t, v]) => [t, v.circuit])));
+  } catch { /* gateway not up yet */ }
+}
+
+async function runCascade(cutAfter) {
+  const answer = $("c-answer"), logEl = $("c-log"), verdict = $("c-verdict");
+  answer.innerHTML = ""; logEl.innerHTML = ""; verdict.textContent = ""; verdict.className = "verdict"; $("c-err").textContent = "";
+  busy(["c-normal", "c-cut", "c-reset"], true);
+  const t0 = performance.now();
+  let current = null, events = 0;
+  const headers = cutAfter == null ? {} : { "X-Chaos-Cut-Primary-After": String(cutAfter) };
+  try {
+    await postSSE("/answer/stream", { question: $("c-q").value }, headers, (e) => {
+      events++;
+      const t = ((performance.now() - t0) / 1000).toFixed(2);
+      if (e.type === "answer_delta") {
+        if (!current || current.dataset.tier !== e.tier) {
+          current = document.createElement("span");
+          current.className = `t-${e.tier}`; current.dataset.tier = e.tier; current.title = `${e.tier} · ${e.model}`;
+          answer.appendChild(current);
+        }
+        current.textContent += e.text;
+      } else if (e.type === "tier_switch") {
+        const mark = document.createElement("span");
+        mark.className = "switch"; mark.textContent = `⚡ ${e.from_tier} → ${e.to_tier ?? "none"}`;
+        answer.appendChild(mark); current = null;
+        log(logEl, `${t}s  tier_switch ${e.from_tier} → ${e.to_tier} after ${e.chars_already_sent} chars — ${e.reason}`);
+      } else if (e.type === "tier_skipped") {
+        log(logEl, `${t}s  tier_skipped ${e.tier} (${e.reason}) — no request sent to it`);
+      } else if (e.type === "answer_done") {
+        renderCircuits(e.circuits);
+        const tiers = e.served_by.join(" → ");
+        const chars = Object.entries(e.chars_by_tier).filter(([, n]) => n).map(([t, n]) => `${t} ${n} chars`).join(", ");
+        log(logEl, `${t}s  answer_done ${e.status}, served by ${tiers} (${chars}) — ${events} events, one connection`);
+        const survived = e.status === "completed";
+        verdict.className = `verdict ${survived ? "ok" : "bad"}`;
+        verdict.textContent = survived
+          ? (e.served_by.length > 1
+              ? `✓ Connection survived the cut: ${tiers} in one response (${events} events, ${t}s).`
+              : `✓ Completed by ${tiers} (${t}s).`)
+          : `✗ Every tier failed (exhausted).`;
+      } else if (e.type === "error") {
+        $("c-err").textContent = e.message;
+      }
+    });
+  } catch (err) {
+    $("c-err").textContent = String(err.message).startsWith("403")
+      ? "403 — fault injection is off. Restart the gateway with CHAOS_ENABLED=true to use ✂ Cut and Reset."
+      : err.message;
+  } finally {
+    busy(["c-normal", "c-cut", "c-reset"], false);
+  }
+}
+$("c-normal").onclick = () => runCascade(null);
+$("c-cut").onclick = () => runCascade(Number($("c-n").value));
+$("c-reset").onclick = async () => {
+  $("c-err").textContent = "";
+  const r = await fetch("/cascade/reset", { method: "POST" });
+  if (r.status === 403) $("c-err").textContent = "403 — reset needs CHAOS_ENABLED=true on the gateway.";
+  else { log($("c-log"), "breakers reset — all circuits closed"); refreshCircuits(); }
+};
+
+// ---- 2. cache ------------------------------------------------------------
+let attempt = 0;
+async function refreshCacheStats() {
+  try {
+    const s = await (await fetch("/cache/stats")).json();
+    $("k-stats").textContent =
+      `/cache/stats → lookups ${s.lookups} · hits ${s.hits} · misses ${s.misses} · bypasses ${s.bypasses} · ` +
+      `hit rate ${(100 * s.hit_rate_cacheable).toFixed(0)}% of cacheable · saved $${s.saved_usd.toFixed(4)} of $${s.spend_without_cache_usd.toFixed(4)} (${s.savings_pct}%)`;
+  } catch { /* ignore */ }
+}
+$("k-ask").onclick = async () => {
+  $("k-err").textContent = ""; busy(["k-ask"], true);
+  const q = $("k-q").value, n = ++attempt;
+  const row = document.createElement("tr");
+  row.innerHTML = `<td>${n}</td><td>${esc(q.slice(0, 60))}${q.length > 60 ? "…" : ""}</td><td colspan="5">running the swarm…</td>`;
+  $("k-rows").appendChild(row);
+  const t0 = performance.now();
+  try {
+    const resp = await fetch("/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: q }) });
+    if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+    const d = await resp.json();
+    const wall = ((performance.now() - t0) / 1000).toFixed(2);
+    const c = d.cache || {};
+    row.innerHTML = `<td>${n}</td><td>${esc(q.slice(0, 60))}${q.length > 60 ? "…" : ""}</td>` +
+      `<td class="${c.status}" title="${esc(c.reason || "")}">${c.status}</td>` +
+      `<td>${c.similarity == null ? "—" : c.similarity.toFixed(3)}</td><td>${wall}s</td>` +
+      `<td>$${(d.cost_usd ?? 0).toFixed(4)}</td><td>${d.status}</td>`;
+    $("k-answer").textContent = d.response || (d.pending_writes.length ? `Paused for staff approval: ${d.pending_writes.map((w) => w.category).join(", ")} ticket drafted.` : "");
+  } catch (err) {
+    row.lastElementChild.textContent = "failed"; $("k-err").textContent = err.message;
+  } finally {
+    busy(["k-ask"], false); refreshCacheStats();
+  }
+};
+
+// ---- 3. agent stream -----------------------------------------------------
+$("a-go").onclick = async () => {
+  const logEl = $("a-log"); logEl.innerHTML = ""; $("a-answer").textContent = ""; $("a-err").textContent = "";
+  busy(["a-go"], true);
+  const t0 = performance.now();
+  try {
+    await postSSE("/analyze/stream", { message: $("a-q").value }, {}, (e) => {
+      const t = ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
+      if (e.type === "agent_handoff") log(logEl, `${t}s  handoff        ${e.node} ${Object.keys(e.detail).length ? JSON.stringify(e.detail) : ""}`);
+      else if (e.type === "tool_call") log(logEl, `${t}s  tool_call      ${e.specialist ?? ""} → ${e.tool}(${JSON.stringify(e.args).slice(0, 70)})`);
+      else if (e.type === "tool_result") log(logEl, `${t}s  tool_result    ${e.specialist ?? ""} ← ${e.tool}`);
+      else if (e.type === "specialist_finding") log(logEl, `${t}s  finding        ${e.specialist}`);
+      else if (e.type === "approval_required") log(logEl, `${t}s  approval_req   ${e.category} ticket drafted — waiting for a human`);
+      else if (e.type === "final_answer") $("a-answer").textContent = e.response || "";
+      else if (e.type === "done") log(logEl, `${t}s  done           ${e.status}`);
+      else if (e.type === "error") $("a-err").textContent = e.message;
+    });
+  } catch (err) {
+    $("a-err").textContent = err.message;
+  } finally {
+    busy(["a-go"], false);
+  }
+};
+
+refreshCircuits();
+refreshCacheStats();
+</script>
+</body>
+</html>

@@ -3,12 +3,13 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -301,6 +302,16 @@ def answer_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Request-Id": request_id},
     )
+
+
+_DEMO_PAGE = Path(__file__).resolve().parent / "static" / "demo.html"
+
+
+@app.get("/demo", include_in_schema=False)
+def demo() -> FileResponse:
+    """Reviewer demo page: cut-the-cable, semantic cache and live agent
+    stream, each calling this gateway's real endpoints from the browser."""
+    return FileResponse(_DEMO_PAGE, media_type="text/html")
 
 
 @app.get("/cascade/health")
